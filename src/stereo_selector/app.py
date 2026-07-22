@@ -40,7 +40,6 @@ from .models import (
     sample_is_copied,
     summarize_missing,
 )
-from . import __version__
 from .mapping import MappingDialog
 from .settings import AppPreferences, SettingsDialog
 from .theme import style_for
@@ -86,8 +85,6 @@ class MainWindow(QMainWindow):
 
         if initial_project is not None:
             QTimer.singleShot(0, lambda: self.load_project(initial_project))
-        else:
-            QTimer.singleShot(180, self.choose_project)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -120,12 +117,9 @@ class MainWindow(QMainWindow):
         status = QStatusBar()
         status.setSizeGripEnabled(False)
         self.setStatusBar(status)
-        self.status_text = QLabel("就绪  ·  拖放项目文件夹到窗口即可打开")
+        self.status_text = QLabel("就绪")
         self.status_text.setContentsMargins(7, 0, 0, 0)
         status.addWidget(self.status_text, 1)
-        self.shortcut_hint = QLabel("←/→ 浏览   Enter 接受   F 聚焦   Ctrl+B 侧栏")
-        self.shortcut_hint.setObjectName("muted")
-        status.addPermanentWidget(self.shortcut_hint)
 
     def _build_sidebar(self) -> QFrame:
         sidebar = QFrame()
@@ -274,8 +268,9 @@ class MainWindow(QMainWindow):
         self.header_breadcrumb = QLabel("未打开项目")
         self.header_breadcrumb.setObjectName("breadcrumb")
         self.header_breadcrumb.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.view_hint = QLabel("选择项目后开始审阅")
+        self.view_hint = QLabel("")
         self.view_hint.setObjectName("viewHint")
+        self.view_hint.hide()
         breadcrumb_box.addWidget(self.header_breadcrumb)
         breadcrumb_box.addWidget(self.view_hint)
         self.reset_button = QPushButton("重置视图  R")
@@ -300,8 +295,8 @@ class MainWindow(QMainWindow):
         self.media_grid.setContentsMargins(10, 10, 10, 10)
         self.media_grid.setSpacing(10)
         self.no_views_hint = NoViewsHint()
-        # A hidden OpenGL child exists before the top-level window is first shown.
-        # This prevents Windows from recreating the native window when PLY is selected later.
+        # Create the native OpenGL child before the frameless top-level window is
+        # shown. The backend itself is imported in parallel while the splash is up.
         self.gl_warmup = PointCloudCanvas(self.media_container)
         self.gl_warmup.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
         self.gl_warmup.setGeometry(0, 0, 2, 2)
@@ -454,13 +449,14 @@ class MainWindow(QMainWindow):
         self.project_name_label.setText(dataset.root.name)
         self.project_path_label.setText(str(dataset.root))
         self.project_path_label.setToolTip(str(dataset.root))
-        match_mode = "按顺序强制匹配" if dataset.force_order else "按文件名匹配"
         available_set = set(dataset.available_modalities)
         complete_count = sum(available_set.issubset(sample.files) for sample in dataset.samples)
         incomplete_count = len(dataset.samples) - complete_count
         incomplete_text = f" · {incomplete_count} 组不完整" if incomplete_count else ""
+        force_order_text = " · 强制顺序" if dataset.force_order else ""
         self.project_summary_label.setText(
-            f"{len(dataset.samples)} 组样本 · {len(dataset.available_modalities)} 种数据 · {match_mode}{incomplete_text}"
+            f"{len(dataset.samples)} 组 · {len(dataset.available_modalities)} 种数据"
+            f"{force_order_text}{incomplete_text}"
         )
         self.output_label.setText(str(dataset.output_root))
         self.output_label.setToolTip(str(dataset.output_root))
@@ -603,7 +599,7 @@ class MainWindow(QMainWindow):
             self.no_views_hint.setVisible(True)
             self.media_grid.setRowStretch(0, 1)
             self.media_grid.setColumnStretch(0, 1)
-            self.view_hint.setText("未选择视图 · 使用数字键 1–5 快速切换")
+            self._set_view_hint("未选择视图")
             return
 
         self.no_views_hint.setVisible(False)
@@ -616,7 +612,7 @@ class MainWindow(QMainWindow):
             self.media_grid.addWidget(self.tiles[self.focused_modality], 0, 0)
             self.media_grid.setRowStretch(0, 1)
             self.media_grid.setColumnStretch(0, 1)
-            self.view_hint.setText("聚焦模式 · Esc 或 F 返回对比")
+            self._set_view_hint("聚焦")
             return
 
         self.focused_modality = None
@@ -631,7 +627,11 @@ class MainWindow(QMainWindow):
             self.media_grid.setColumnStretch(column, 1)
         for row in range(max(1, (len(selected) + columns - 1) // columns)):
             self.media_grid.setRowStretch(row, 1)
-        self.view_hint.setText("滚轮缩放 · 拖动平移 · 双击适应")
+        self._set_view_hint("")
+
+    def _set_view_hint(self, text: str) -> None:
+        self.view_hint.setText(text)
+        self.view_hint.setVisible(bool(text))
 
     def focus_modality(self, modality: str) -> None:
         self.focused_modality = None if self.focused_modality == modality else modality
@@ -659,7 +659,7 @@ class MainWindow(QMainWindow):
 
         self.sample_title.setText(sample.display_name)
         self.sample_meta.setText(
-            f"第 {self.current_index + 1} / {len(self.dataset.samples)} 组  ·  匹配 {len(sample.files)} 个文件"
+            f"第 {self.current_index + 1} / {len(self.dataset.samples)} 组  ·  {len(sample.files)} 个文件"
         )
         is_accepted = sample.key in self.accepted
         self.sample_status.setText("已接受" if is_accepted else "待审阅")
@@ -682,7 +682,7 @@ class MainWindow(QMainWindow):
             names = "、".join(modality_label(name) for name in missing)
             self.status_text.setText(f"当前样本缺少：{names}")
         else:
-            self.status_text.setText("所有已选视图均已匹配")
+            self.status_text.setText("就绪")
         self._update_controls()
 
     def _timeline_changed(self, value: int) -> None:
@@ -785,10 +785,6 @@ class MainWindow(QMainWindow):
         self.next_button.setText(f"{self.preferences.button_labels['next']}  {self._shortcut_text('next')}")
         self.accept_button.setText(f"{self.preferences.button_labels['accept']}  {self._shortcut_text('accept')}")
         self.reset_button.setText(f"重置视图  {self._shortcut_text('reset')}")
-        self.shortcut_hint.setText(
-            f"{self._shortcut_text('previous')}/{self._shortcut_text('next')} 浏览   "
-            f"{self._shortcut_text('accept')} 接受   {self._shortcut_text('focus')} 聚焦   Ctrl+, 设置"
-        )
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.preferences, self)
@@ -963,24 +959,33 @@ def start_smoke_test(app: QApplication, window: MainWindow, timeout_seconds: flo
     timer.start()
 
 
-def main(argv: list[str] | None = None) -> int:
+def run_application(
+    app: QApplication,
+    argv: list[str] | None = None,
+    splash: QWidget | None = None,
+) -> int:
     args = build_parser().parse_args(argv)
     if args.smoke_test and args.project is None:
         raise SystemExit("--smoke-test requires a project folder")
-    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
-    app = QApplication(sys.argv[:1] if argv is not None else sys.argv)
-    app.setApplicationName("Stereo Selector")
-    app.setOrganizationName("ToolBox")
-    app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
     startup_preferences = AppPreferences.load(QSettings("ToolBox", "StereoSelector"))
     app.setStyleSheet(style_for(startup_preferences.theme))
     QThreadPool.globalInstance().setMaxThreadCount(3)
     window = MainWindow(args.project)
+    window.setWindowIcon(app.windowIcon())
     window.show()
+    app.processEvents()
+    if splash is not None:
+        splash.close()
     if args.smoke_test:
         start_smoke_test(app, window)
     return app.exec()
+
+
+def main(argv: list[str] | None = None) -> int:
+    from .bootstrap import main as bootstrap_main
+
+    return bootstrap_main(argv)
 
 
 if __name__ == "__main__":

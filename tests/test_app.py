@@ -9,8 +9,10 @@ from PIL import Image
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtCore import Qt
 from PySide6.QtCore import QSettings, QThreadPool
+from PySide6.QtTest import QTest
 
 from stereo_selector.app import MainWindow
+from stereo_selector.bootstrap import application_icon, asset_path
 from stereo_selector.mapping import MappingDialog
 from stereo_selector.settings import (
     AppPreferences,
@@ -30,6 +32,32 @@ def _make_project(root: Path) -> Path:
     return root
 
 
+def test_empty_startup_stays_idle_without_open_dialog(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    choose_calls: list[bool] = []
+    monkeypatch.setattr(MainWindow, "choose_project", lambda self: choose_calls.append(True))
+
+    window = MainWindow()
+    window.show()
+    QTest.qWait(260)
+    app.processEvents()
+
+    assert choose_calls == []
+    assert window.dataset is None
+    assert window.content_stack.currentWidget() is window.empty_hint
+    assert window.status_text.text() == "就绪"
+    assert window.view_hint.isHidden()
+    assert not hasattr(window, "shortcut_hint")
+    window.close()
+
+
+def test_application_icon_asset_is_available() -> None:
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    assert asset_path("app_icon.png").is_file()
+    assert not application_icon().isNull()
+
+
 def test_review_focus_and_accept_flow(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     project = _make_project(tmp_path / "capture")
@@ -39,6 +67,8 @@ def test_review_focus_and_accept_flow(tmp_path: Path) -> None:
     assert window.dataset is not None
     assert len(window.dataset.samples) == 2
     assert list(window.tiles) == ["left", "right"]
+    assert "按文件名匹配" not in window.project_summary_label.text()
+    assert "滚轮缩放" not in window.view_hint.text()
 
     window.focus_modality("left")
     assert window.focused_modality == "left"

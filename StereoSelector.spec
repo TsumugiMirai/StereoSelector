@@ -3,7 +3,7 @@
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 hiddenimports = collect_submodules("pyqtgraph.opengl")
-datas = collect_data_files("pyqtgraph")
+datas = collect_data_files("pyqtgraph") + [("src/stereo_selector/assets", "stereo_selector/assets")]
 
 a = Analysis(
     ["main.py"],
@@ -36,6 +36,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon="src/stereo_selector/assets/app_icon.png",
     version="version_info.txt",
 )

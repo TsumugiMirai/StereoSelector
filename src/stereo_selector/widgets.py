@@ -587,10 +587,6 @@ class DropHint(QFrame):
         open_button = QPushButton("选择项目文件夹")
         open_button.setObjectName("primaryButton")
         open_button.clicked.connect(self.open_requested)
-        formats = QLabel("支持  left  ·  right  ·  depth_fsd  ·  depth_color  ·  ply")
-        formats.setObjectName("emptyFormats")
-        formats.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
         layout.addWidget(mark, 0, Qt.AlignmentFlag.AlignHCenter)
         layout.addSpacing(16)
         layout.addWidget(title)
@@ -598,8 +594,6 @@ class DropHint(QFrame):
         layout.addWidget(hint)
         layout.addSpacing(18)
         layout.addWidget(open_button, 0, Qt.AlignmentFlag.AlignHCenter)
-        layout.addSpacing(24)
-        layout.addWidget(formats)
 
 
 class NoViewsHint(QFrame):
@@ -611,8 +605,4 @@ class NoViewsHint(QFrame):
         title = QLabel("尚未选择对比视图")
         title.setObjectName("emptyTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint = QLabel("从左侧选择任意一种数据，或使用数字键 1–5")
-        hint.setObjectName("emptyHint")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
-        layout.addWidget(hint)

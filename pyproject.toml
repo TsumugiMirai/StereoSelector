@@ -22,13 +22,16 @@ build = ["pyinstaller>=6.8,<7"]
 test = ["pytest>=8,<9"]
 
 [project.scripts]
-stereo-selector = "stereo_selector.app:main"
+stereo-selector = "stereo_selector.bootstrap:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+stereo_selector = ["assets/*.png", "assets/*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
