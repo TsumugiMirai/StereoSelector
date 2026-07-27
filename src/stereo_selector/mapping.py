@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -17,10 +15,10 @@ from PySide6.QtWidgets import (
 )
 
 from .models import MODALITY_INFO, modality_label
-from .settings import DialogHeader, SettingRow, ToggleSwitch
+from .settings import DialogCloseButton, DialogHeader, SettingRow, ShadowDialog, ToggleSwitch
 
 
-class MappingDialog(QDialog):
+class MappingDialog(ShadowDialog):
     """Manual modality-folder mapping and positional matching configuration."""
 
     def __init__(
@@ -32,25 +30,18 @@ class MappingDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.root = root.expanduser().resolve()
-        self.setObjectName("settingsDialog")
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
-        self.setModal(True)
         self.resize(850, 610)
         self.setMinimumSize(760, 560)
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(1, 1, 1, 1)
-        outer.setSpacing(0)
+        outer = self.outer
 
         header = DialogHeader()
         header.setObjectName("settingsHeader")
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(18, 0, 6, 0)
-        title = QLabel("视图文件夹与匹配")
+        title = QLabel("视图映射")
         title.setObjectName("settingsTitle")
-        close = QPushButton("×")
-        close.setObjectName("settingsCloseButton")
-        close.setFixedSize(42, 40)
+        close = DialogCloseButton()
         close.clicked.connect(self.reject)
         header_layout.addWidget(title)
         header_layout.addStretch(1)
@@ -62,11 +53,10 @@ class MappingDialog(QDialog):
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(30, 24, 30, 24)
         body_layout.setSpacing(9)
-        heading = QLabel("手动指定数据视图")
+        heading = QLabel(self.root.name)
         heading.setObjectName("settingsPageTitle")
-        description = QLabel(
-            f"项目：{self.root}\n未填写的类型继续使用自动识别。所选文件夹必须位于项目目录内。"
-        )
+        heading.setToolTip(str(self.root))
+        description = QLabel("未指定的视图将自动识别。")
         description.setObjectName("settingsDescription")
         description.setWordWrap(True)
         body_layout.addWidget(heading)
@@ -98,8 +88,8 @@ class MappingDialog(QDialog):
 
         self.force_order_switch = ToggleSwitch(force_order)
         force_row = SettingRow(
-            "按顺序强制匹配",
-            "忽略文件名差异；各文件夹自然排序后，第 1 个与第 1 个直接对应。",
+            "强制顺序匹配",
+            "按各文件夹的自然排序一一对应。",
             self.force_order_switch,
         )
         body_layout.addWidget(force_row)
@@ -112,7 +102,7 @@ class MappingDialog(QDialog):
         footer_layout.setContentsMargins(14, 10, 14, 10)
         cancel = QPushButton("取消")
         cancel.clicked.connect(self.reject)
-        apply_button = QPushButton("应用并重新扫描")
+        apply_button = QPushButton("应用")
         apply_button.setObjectName("primaryButton")
         apply_button.clicked.connect(self._validate_and_accept)
         footer_layout.addStretch(1)

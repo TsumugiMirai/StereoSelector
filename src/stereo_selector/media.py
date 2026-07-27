@@ -15,6 +15,25 @@ class PointCloudData:
     original_count: int
 
 
+@dataclass(frozen=True)
+class ImageData:
+    image: QImage
+    values: np.ndarray
+
+
+@dataclass(frozen=True)
+class DepthStats:
+    width: int
+    height: int
+    minimum: float | None
+    maximum: float | None
+    invalid_ratio: float
+    zero_ratio: float
+    hole_ratio: float
+    extreme_threshold: float | None
+    extreme_ratio: float
+
+
 def _normalize_numeric(array: np.ndarray) -> np.ndarray:
     values = array.astype(np.float32, copy=False)
     finite = np.isfinite(values)
@@ -29,12 +48,12 @@ def _normalize_numeric(array: np.ndarray) -> np.ndarray:
     return scaled.astype(np.uint8)
 
 
-def load_image(path: Path) -> QImage:
+def load_image_data(path: Path) -> ImageData:
     with Image.open(path) as opened:
         image = ImageOps.exif_transpose(opened)
         if image.mode in {"1", "P", "LA", "CMYK", "YCbCr", "LAB", "HSV"}:
             image = image.convert("RGB")
-        array = np.asarray(image)
+        array = np.asarray(image).copy()
 
     if array.ndim == 2:
         gray = array.astype(np.uint8, copy=False) if array.dtype == np.uint8 else _normalize_numeric(array)
@@ -50,10 +69,53 @@ def load_image(path: Path) -> QImage:
 
     rgb = np.ascontiguousarray(rgb)
     height, width, channels = rgb.shape
-    return QImage(rgb.data, width, height, width * channels, QImage.Format.Format_RGB888).copy()
+    qimage = QImage(rgb.data, width, height, width * channels, QImage.Format.Format_RGB888).copy()
+    return ImageData(qimage, array)
 
 
-def load_point_cloud(path: Path, max_points: int = 450_000) -> PointCloudData:
+def load_image(path: Path) -> QImage:
+    return load_image_data(path).image
+
+
+def analyze_depth(values: np.ndarray) -> DepthStats:
+    """Return robust quality indicators without assuming a specific depth unit."""
+    array = np.asarray(values)
+    if array.ndim == 3:
+        array = array[..., 0]
+    numeric = array.astype(np.float64, copy=False)
+    finite = np.isfinite(numeric)
+    zero = finite & (numeric == 0)
+    holes = ~finite | (numeric <= 0)
+    positive = numeric[finite & (numeric > 0)]
+    total = max(1, numeric.size)
+    if positive.size:
+        minimum = float(positive.min())
+        maximum = float(positive.max())
+        extreme_threshold = float(np.percentile(positive, 99.5))
+        extreme_ratio = float(np.count_nonzero(positive > extreme_threshold) / total)
+    else:
+        minimum = maximum = extreme_threshold = None
+        extreme_ratio = 0.0
+    height, width = numeric.shape[:2]
+    return DepthStats(
+        width=width,
+        height=height,
+        minimum=minimum,
+        maximum=maximum,
+        invalid_ratio=float(np.count_nonzero(~finite) / total),
+        zero_ratio=float(np.count_nonzero(zero) / total),
+        hole_ratio=float(np.count_nonzero(holes) / total),
+        extreme_threshold=extreme_threshold,
+        extreme_ratio=extreme_ratio,
+    )
+
+
+def load_point_cloud(
+    path: Path,
+    max_points: int = 450_000,
+    rotation: np.ndarray | None = None,
+    translation: np.ndarray | None = None,
+) -> PointCloudData:
     from plyfile import PlyData
 
     ply = PlyData.read(str(path))
@@ -85,6 +147,11 @@ def load_point_cloud(path: Path, max_points: int = 450_000) -> PointCloudData:
         np.float32,
         copy=False,
     )
+    if rotation is not None:
+        rotation = np.asarray(rotation, dtype=np.float32).reshape(3, 3)
+        points = points @ rotation.T
+    if translation is not None:
+        points = points + np.asarray(translation, dtype=np.float32).reshape(1, 3)
 
     color_fields = next(
         (fields for fields in (("red", "green", "blue"), ("r", "g", "b")) if set(fields).issubset(names)),

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from stereo_selector.models import DatasetScanner, copy_sample, normalized_sample_key, sample_is_copied
 
 
@@ -96,3 +98,52 @@ def test_manual_directories_can_force_positional_matching(tmp_path: Path) -> Non
     assert [sample.files["left"].name for sample in dataset.samples] == ["left_2.png", "left_10.png"]
     assert [sample.files["right"].name for sample in dataset.samples] == ["unrelated_a.png", "unrelated_b.png"]
     assert all(set(sample.files) == {"left", "right"} for sample in dataset.samples)
+
+
+def test_custom_output_root_is_used_for_all_copied_files(tmp_path: Path) -> None:
+    root = tmp_path / "capture"
+    source = root / "left" / "frame_0001.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"image")
+    output_root = tmp_path / "exports" / "reviewed_capture"
+
+    dataset = DatasetScanner().scan(root, output_root=output_root)
+    copied = copy_sample(dataset, dataset.samples[0])
+
+    assert dataset.output_root == output_root.resolve()
+    assert copied == [output_root.resolve() / "left" / "frame_0001.png"]
+    assert copied[0].read_bytes() == b"image"
+
+
+def test_output_root_cannot_be_inside_project(tmp_path: Path) -> None:
+    root = tmp_path / "capture"
+    (root / "left").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="不能位于项目文件夹内部"):
+        DatasetScanner().scan(root, output_root=root / "selected")
+
+
+def test_unconventional_partial_folders_are_inferred_from_names_and_formats(tmp_path: Path) -> None:
+    root = tmp_path / "capture"
+    files = (
+        ("Camera-L", "shot_01.png", b"rgb"),
+        ("Camera-R", "shot_01.png", b"rgb"),
+        ("metric_maps", "shot_01.tiff", b"depth"),
+        ("colored-depth-preview", "shot_01.jpg", b"color"),
+        ("reconstruction_cloud", "shot_01.ply", b"ply"),
+    )
+    for folder, name, content in files:
+        path = root / folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if folder == "metric_maps":
+            from PIL import Image
+            import numpy as np
+
+            Image.fromarray(np.array([[1000]], dtype=np.uint16)).save(path)
+        else:
+            path.write_bytes(content)
+
+    dataset = DatasetScanner().scan(root)
+
+    assert dataset.available_modalities == ["left", "right", "depth_fsd", "depth_color", "ply"]
+    assert all(len(dataset.files[name]) == 1 for name in dataset.available_modalities)

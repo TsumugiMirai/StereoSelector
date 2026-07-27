@@ -10,7 +10,7 @@ from pathlib import Path
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
 from . import __version__
@@ -25,6 +25,16 @@ def asset_path(name: str) -> Path:
 
 def application_icon() -> QIcon:
     return QIcon(str(asset_path("app_icon.png")))
+
+
+def application_font() -> QFont:
+    """Use one CJK-capable UI family for Qt widgets and native popup surfaces."""
+    families = set(QFontDatabase.families())
+    family = "Microsoft YaHei UI" if "Microsoft YaHei UI" in families else "Segoe UI"
+    font = QFont(family)
+    font.setPointSizeF(9.5)
+    font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+    return font
 
 
 def _set_windows_app_id() -> None:
@@ -52,7 +62,7 @@ def _splash_pixmap(icon: QIcon) -> QPixmap:
     painter.drawPixmap(42, 48, icon_pixmap)
 
     painter.setPen(QColor("#f2f2f2"))
-    title_font = QFont("Segoe UI", 18)
+    title_font = QFont("Microsoft YaHei UI", 18)
     title_font.setWeight(QFont.Weight.DemiBold)
     painter.setFont(title_font)
     painter.drawText(126, 72, "Stereo Selector")
@@ -84,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName("Stereo Selector")
     app.setOrganizationName("ToolBox")
     app.setApplicationVersion(__version__)
+    app.setFont(application_font())
     icon = application_icon()
     app.setWindowIcon(icon)
 

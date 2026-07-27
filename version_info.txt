@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(1, 0, 0, 0),
-        prodvers=(1, 0, 0, 0),
+        filevers=(1, 1, 0, 0),
+        prodvers=(1, 1, 0, 0),
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -18,11 +18,11 @@ VSVersionInfo(
                     [
                         StringStruct("CompanyName", "ToolBox"),
                         StringStruct("FileDescription", "Stereo image and point-cloud selector"),
-                        StringStruct("FileVersion", "1.0.0.0"),
+                        StringStruct("FileVersion", "1.1.0.0"),
                         StringStruct("InternalName", "StereoSelector"),
-                        StringStruct("OriginalFilename", "StereoSelector-v1.0.exe"),
+                        StringStruct("OriginalFilename", "StereoSelector-v1.1.exe"),
                         StringStruct("ProductName", "Stereo Selector"),
-                        StringStruct("ProductVersion", "1.0.0"),
+                        StringStruct("ProductVersion", "1.1.0"),
                     ],
                 )
             ]

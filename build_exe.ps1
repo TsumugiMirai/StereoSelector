@@ -12,7 +12,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed with exit code $LASTEXITCODE."
     }
-    $OutputExe = Join-Path $ProjectRoot "dist\StereoSelector-v1.0.exe"
+    $OutputExe = Join-Path $ProjectRoot "dist\StereoSelector-v1.1.exe"
     if (-not (Test-Path -LiteralPath $OutputExe)) {
         throw "Build finished without the expected output: $OutputExe"
     }
