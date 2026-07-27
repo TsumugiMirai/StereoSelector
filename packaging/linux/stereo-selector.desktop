@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Stereo Selector
+Comment=Review synchronized stereo images, depth maps, and point clouds
+Exec=stereo-selector
+Icon=stereo-selector
+Categories=Graphics;Utility;
+Terminal=false

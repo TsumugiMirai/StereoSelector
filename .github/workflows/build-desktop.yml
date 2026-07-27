@@ -1,0 +1,285 @@
+name: Build desktop packages
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to receive the packages, for example v1.1
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-22.04
+    outputs:
+      app_name: ${{ steps.version.outputs.app_name }}
+      project_version: ${{ steps.version.outputs.project_version }}
+      release_version: ${{ steps.version.outputs.release_version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Read application version
+        id: version
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+          if match is None:
+              raise SystemExit("Unable to read the project version")
+          project_version = match.group(1)
+          parts = project_version.split(".")
+          release_version = ".".join(parts[:2]) if len(parts) == 3 and parts[2] == "0" else project_version
+          values = {
+              "project_version": project_version,
+              "release_version": release_version,
+              "app_name": f"StereoSelector-v{release_version}",
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          PY
+
+      - name: Install Linux test libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[test]"
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows x64
+            runner: windows-latest
+            python_arch: x64
+            platform: windows
+            package_suffix: windows-x64
+          - label: macOS Intel
+            runner: macos-15-intel
+            python_arch: x64
+            platform: macos
+            package_suffix: macos-x64
+          - label: macOS Apple Silicon
+            runner: macos-15
+            python_arch: arm64
+            platform: macos
+            package_suffix: macos-arm64
+          - label: Linux x64
+            runner: ubuntu-22.04
+            python_arch: x64
+            platform: linux
+            package_suffix: linux-x64
+    runs-on: ${{ matrix.runner }}
+    env:
+      APP_NAME: ${{ needs.test.outputs.app_name }}
+      PROJECT_VERSION: ${{ needs.test.outputs.project_version }}
+      RELEASE_VERSION: ${{ needs.test.outputs.release_version }}
+      TARGET_ARCH: ${{ matrix.python_arch }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.python_arch }}
+          cache: pip
+
+      - name: Install Linux build libraries
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libegl1 libfuse2 libgl1 libxkbcommon-x11-0 libxcb-cursor0
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[build]"
+
+      - name: Create macOS icon
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_icon="src/stereo_selector/assets/app_icon.png"
+          iconset="build/StereoSelector.iconset"
+          mkdir -p "$iconset"
+          sips -z 16 16 "$source_icon" --out "$iconset/icon_16x16.png"
+          sips -z 32 32 "$source_icon" --out "$iconset/icon_16x16@2x.png"
+          sips -z 32 32 "$source_icon" --out "$iconset/icon_32x32.png"
+          sips -z 64 64 "$source_icon" --out "$iconset/icon_32x32@2x.png"
+          sips -z 128 128 "$source_icon" --out "$iconset/icon_128x128.png"
+          sips -z 256 256 "$source_icon" --out "$iconset/icon_128x128@2x.png"
+          sips -z 256 256 "$source_icon" --out "$iconset/icon_256x256.png"
+          sips -z 512 512 "$source_icon" --out "$iconset/icon_256x256@2x.png"
+          sips -z 512 512 "$source_icon" --out "$iconset/icon_512x512.png"
+          sips -z 1024 1024 "$source_icon" --out "$iconset/icon_512x512@2x.png"
+          iconutil -c icns "$iconset" -o "build/StereoSelector.icns"
+          echo "STEREO_SELECTOR_ICON=$PWD/build/StereoSelector.icns" >> "$GITHUB_ENV"
+
+      - name: Build with PyInstaller
+        run: python -m PyInstaller --noconfirm --clean StereoSelector.spec
+
+      - name: Prepare Windows package
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_path="dist/${APP_NAME}.exe"
+          test -f "$package_path"
+          echo "PACKAGE_PATH=$package_path" >> "$GITHUB_ENV"
+
+      - name: Prepare macOS package
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="dist/${APP_NAME}.app"
+          package_path="dist/${APP_NAME}-macOS-${TARGET_ARCH}.dmg"
+          test -d "$app_path"
+          codesign --force --deep --sign - "$app_path"
+          codesign --verify --deep --strict "$app_path"
+          hdiutil create \
+            -volname "Stereo Selector ${RELEASE_VERSION}" \
+            -srcfolder "$app_path" \
+            -ov \
+            -format UDZO \
+            "$package_path"
+          echo "PACKAGE_PATH=$package_path" >> "$GITHUB_ENV"
+
+      - name: Prepare Linux AppImage
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_dir="build/AppDir"
+          package_path="dist/${APP_NAME}-linux-x86_64.AppImage"
+          mkdir -p \
+            "$app_dir/usr/bin" \
+            "$app_dir/usr/share/applications" \
+            "$app_dir/usr/share/icons/hicolor/256x256/apps"
+          cp "dist/${APP_NAME}" "$app_dir/usr/bin/${APP_NAME}"
+          ln -s "$APP_NAME" "$app_dir/usr/bin/stereo-selector"
+          cp packaging/linux/AppRun "$app_dir/AppRun"
+          cp packaging/linux/stereo-selector.desktop "$app_dir/stereo-selector.desktop"
+          cp packaging/linux/stereo-selector.desktop "$app_dir/usr/share/applications/stereo-selector.desktop"
+          cp src/stereo_selector/assets/app_icon.png "$app_dir/stereo-selector.png"
+          cp src/stereo_selector/assets/app_icon.png \
+            "$app_dir/usr/share/icons/hicolor/256x256/apps/stereo-selector.png"
+          chmod +x "$app_dir/AppRun" "$app_dir/usr/bin/${APP_NAME}"
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --output build/appimagetool-x86_64.AppImage \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x build/appimagetool-x86_64.AppImage
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 VERSION="$RELEASE_VERSION" \
+            build/appimagetool-x86_64.AppImage "$app_dir" "$package_path"
+          chmod +x "$package_path"
+          echo "PACKAGE_PATH=$package_path" >> "$GITHUB_ENV"
+
+      - name: Verify package
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          package = Path(os.environ["PACKAGE_PATH"])
+          size = package.stat().st_size
+          if size < 1_000_000:
+              raise SystemExit(f"Package is unexpectedly small: {package} ({size} bytes)")
+          print(f"Verified {package}: {size} bytes")
+          PY
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.test.outputs.app_name }}-${{ matrix.package_suffix }}
+          path: ${{ env.PACKAGE_PATH }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish:
+    name: Attach packages to release
+    needs:
+      - test
+      - build
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PROJECT_VERSION: ${{ needs.test.outputs.project_version }}
+      RELEASE_VERSION: ${{ needs.test.outputs.release_version }}
+      REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED_RELEASE_TAG"
+          if [[ -z "$tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+          fi
+          if [[ "$tag" != "v${RELEASE_VERSION}" && "$tag" != "v${PROJECT_VERSION}" ]]; then
+            echo "Release tag $tag does not match project version ${PROJECT_VERSION}." >&2
+            exit 1
+          fi
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh release upload "$tag" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
