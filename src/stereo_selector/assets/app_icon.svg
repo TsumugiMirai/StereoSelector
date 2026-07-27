@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="24" y1="18" x2="231" y2="238" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#242424"/>
+      <stop offset="1" stop-color="#101010"/>
+    </linearGradient>
+    <linearGradient id="left" x1="48" y1="72" x2="115" y2="183" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#67B4FF"/>
+      <stop offset="1" stop-color="#367FE8"/>
+    </linearGradient>
+    <linearGradient id="right" x1="142" y1="70" x2="208" y2="184" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#C59BFF"/>
+      <stop offset="1" stop-color="#8259E8"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000" flood-opacity=".35"/>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#bg)"/>
+  <rect x="9" y="9" width="238" height="238" rx="53" fill="none" stroke="#3B3B3B" stroke-width="2"/>
+  <g filter="url(#shadow)">
+    <path d="M50 76a18 18 0 0 1 18-18h36a18 18 0 0 1 18 18v104a18 18 0 0 1-18 18H68a18 18 0 0 1-18-18V76Z" fill="#191919" stroke="#3B3B3B" stroke-width="3"/>
+    <path d="M134 76a18 18 0 0 1 18-18h36a18 18 0 0 1 18 18v104a18 18 0 0 1-18 18h-36a18 18 0 0 1-18-18V76Z" fill="#191919" stroke="#3B3B3B" stroke-width="3"/>
+    <circle cx="86" cy="108" r="23" fill="url(#left)"/>
+    <circle cx="170" cy="108" r="23" fill="url(#right)"/>
+    <circle cx="86" cy="108" r="11" fill="#121212" opacity=".72"/>
+    <circle cx="170" cy="108" r="11" fill="#121212" opacity=".72"/>
+    <path d="m72 161 10 10 20-25" fill="none" stroke="#74D5A6" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="m156 161 10 10 20-25" fill="none" stroke="#74D5A6" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

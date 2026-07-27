@@ -23,6 +23,24 @@ _TOKEN_RE = re.compile(
     r"(?i)(?:^|[_\-. ])(?:left|right|rgb|depth|fsd|color|colour|raw|vis|ply|pointcloud|point_cloud)(?=$|[_\-. ])"
 )
 _NATURAL_RE = re.compile(r"(\d+)")
+_MODALITY_HINTS = {
+    "left": ("left", "cam_l", "camera_l", "cam0", "camera0", "左目", "左相机"),
+    "right": ("right", "cam_r", "camera_r", "cam1", "camera1", "右目", "右相机"),
+    "depth_color": (
+        "depth_color",
+        "depthcolor",
+        "color_depth",
+        "colored_depth",
+        "depth_vis",
+        "depth_preview",
+        "visual_depth",
+        "pseudo",
+        "伪彩",
+        "彩色深度",
+    ),
+    "depth_fsd": ("depth", "distance", "range", "z16", "disparity", "深度", "视差"),
+    "ply": ("ply", "pointcloud", "point_cloud", "cloud", "点云"),
+}
 
 
 def natural_key(value: str) -> tuple[object, ...]:
@@ -48,6 +66,43 @@ def normalized_sample_key(relative_file: Path) -> str:
     return "/".join(normalized)
 
 
+def infer_modality(directory: Path, media_files: list[Path]) -> str | None:
+    """Infer a supported view from folder/file hints and the actual media format."""
+    if not media_files:
+        return None
+    extensions = {path.suffix.casefold() for path in media_files}
+    if extensions <= POINT_EXTENSIONS:
+        return "ply"
+    if not extensions & IMAGE_EXTENSIONS:
+        return None
+    searchable = " ".join(
+        [directory.name, *(path.stem for path in media_files[:8])]
+    ).casefold()
+    searchable = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "_", searchable)
+    scores = {
+        modality: sum(1 for hint in hints if hint in searchable)
+        for modality, hints in _MODALITY_HINTS.items()
+    }
+    # A color/visualized depth hint is more specific than the generic "depth" token.
+    if scores["depth_color"]:
+        return "depth_color"
+    best = max(("left", "right", "depth_fsd"), key=scores.get)
+    if scores[best]:
+        return best
+
+    # Numeric 16-bit or floating-point grayscale images are overwhelmingly likely
+    # to be raw depth when folder names carry no usable camera hint.
+    try:
+        from PIL import Image
+
+        with Image.open(media_files[0]) as image:
+            if image.mode in {"I", "I;16", "I;16B", "I;16L", "F"}:
+                return "depth_fsd"
+    except OSError:
+        pass
+    return None
+
+
 @dataclass(frozen=True)
 class Sample:
     key: str
@@ -65,6 +120,7 @@ class Dataset:
     files: dict[str, list[Path]] = field(default_factory=dict)
     samples: list[Sample] = field(default_factory=list)
     force_order: bool = False
+    custom_output_root: Path | None = None
 
     @property
     def available_modalities(self) -> list[str]:
@@ -72,7 +128,7 @@ class Dataset:
 
     @property
     def output_root(self) -> Path:
-        return self.root.parent / f"{self.root.name}_select"
+        return self.custom_output_root or (self.root.parent / f"{self.root.name}_select")
 
 
 class DatasetScanner:
@@ -81,10 +137,16 @@ class DatasetScanner:
         root: Path,
         manual_dirs: dict[str, Path] | None = None,
         force_order: bool = False,
+        output_root: Path | None = None,
     ) -> Dataset:
         root = root.expanduser().resolve()
         if not root.is_dir():
             raise ValueError(f"项目文件夹不存在：{root}")
+        resolved_output = output_root.expanduser().resolve() if output_root is not None else None
+        if resolved_output is not None and (
+            resolved_output == root or resolved_output.is_relative_to(root)
+        ):
+            raise ValueError("输出文件夹不能位于项目文件夹内部")
 
         alias_to_modality = {
             alias.casefold(): modality
@@ -105,10 +167,11 @@ class DatasetScanner:
             resolved_manual[modality] = selected
             modality_dirs[modality] = [selected]
 
-        # Discover directory names without recursively visiting every media file.
-        # Once a modality directory is found, its subtree is scanned exactly once below.
+        # Discover exact aliases first, then infer unconventional leaf folder names
+        # from their file extensions, name hints and representative image type.
         manual_paths = set(resolved_manual.values())
-        for current, directory_names, _ in os.walk(root):
+        unknown_image_dirs: list[Path] = []
+        for current, directory_names, file_names in os.walk(root):
             current_path = Path(current)
             directory_names.sort(key=natural_key)
             descend: list[str] = []
@@ -122,6 +185,28 @@ class DatasetScanner:
                 elif modality not in resolved_manual:
                     modality_dirs[modality].append(directory)
             directory_names[:] = descend
+            direct_media = [
+                current_path / name
+                for name in sorted(file_names, key=natural_key)
+                if Path(name).suffix.casefold() in IMAGE_EXTENSIONS | POINT_EXTENSIONS
+            ]
+            if direct_media and current_path != root and current_path not in manual_paths:
+                inferred = infer_modality(current_path, direct_media)
+                if inferred is not None and inferred not in resolved_manual:
+                    modality_dirs[inferred].append(current_path)
+                    directory_names[:] = []
+                elif any(path.suffix.casefold() in IMAGE_EXTENSIONS for path in direct_media):
+                    unknown_image_dirs.append(current_path)
+
+        # When names contain no hints at all, a pair of RGB folders is still a
+        # useful stereo candidate. Natural ordering provides a deterministic fallback.
+        missing_rgb = [name for name in ("left", "right") if not modality_dirs[name]]
+        if unknown_image_dirs and len(unknown_image_dirs) <= len(missing_rgb):
+            for modality, directory in zip(missing_rgb, sorted(unknown_image_dirs, key=lambda p: natural_key(str(p)))):
+                modality_dirs[modality].append(directory)
+
+        for modality, directories in modality_dirs.items():
+            modality_dirs[modality] = list(dict.fromkeys(directories))
 
         files: dict[str, list[Path]] = {name: [] for name in MODALITY_INFO}
         keyed: dict[str, dict[str, Path]] = {name: {} for name in MODALITY_INFO}
@@ -163,6 +248,7 @@ class DatasetScanner:
             files={name: paths for name, paths in files.items() if paths},
             samples=samples,
             force_order=force_order,
+            custom_output_root=resolved_output,
         )
 
 

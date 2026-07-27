@@ -4,10 +4,21 @@ from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QObject,
+    QPointF,
+    QPropertyAnimation,
+    QRunnable,
+    QThreadPool,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QBrush, QColor, QCursor, QPainter, QPen, QPixmap, QVector3D, QWheelEvent
 from PySide6.QtWidgets import (
     QFrame,
+    QGraphicsOpacityEffect,
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
@@ -19,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .media import PointCloudData, load_image, load_point_cloud
+from .media import DepthStats, ImageData, PointCloudData, analyze_depth, load_image_data, load_point_cloud
 from .models import modality_label
 
 
@@ -31,6 +42,11 @@ MODALITY_ACCENTS = {
     "ply": "#56c596",
 }
 
+# After conversion, point-cloud axes are X right, Y forward and Z up.
+# A camera at negative Y looking toward positive Y matches the RGB camera view.
+CAMERA_ALIGNED_AZIMUTH = -90.0
+CAMERA_ALIGNED_ELEVATION = 0.0
+
 
 class MediaWorkerSignals(QObject):
     loaded = Signal(int, object)
@@ -38,12 +54,22 @@ class MediaWorkerSignals(QObject):
 
 
 class MediaLoadWorker(QRunnable):
-    def __init__(self, token: int, modality: str, path: Path, point_limit: int) -> None:
+    def __init__(
+        self,
+        token: int,
+        modality: str,
+        path: Path,
+        point_limit: int,
+        cloud_rotation: np.ndarray | None = None,
+        cloud_translation: np.ndarray | None = None,
+    ) -> None:
         super().__init__()
         self.token = token
         self.modality = modality
         self.path = path
         self.point_limit = point_limit
+        self.cloud_rotation = cloud_rotation
+        self.cloud_translation = cloud_translation
         self.signals = MediaWorkerSignals()
         self._cancelled = False
 
@@ -53,9 +79,14 @@ class MediaLoadWorker(QRunnable):
     def run(self) -> None:
         try:
             result = (
-                load_point_cloud(self.path, self.point_limit)
+                load_point_cloud(
+                    self.path,
+                    self.point_limit,
+                    self.cloud_rotation,
+                    self.cloud_translation,
+                )
                 if self.modality == "ply"
-                else load_image(self.path)
+                else load_image_data(self.path)
             )
         except Exception as exc:
             if not self._cancelled:
@@ -120,7 +151,7 @@ class WindowControlButton(QPushButton):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = QColor("#ffffff") if self.control == "close" and self.underMouse() else self.palette().buttonText().color()
+        color = self.palette().buttonText().color()
         pen = QPen(color, 1.25)
         pen.setCosmetic(True)
         painter.setPen(pen)
@@ -141,11 +172,25 @@ class WindowControlButton(QPushButton):
 class ImageCanvas(QGraphicsView):
     """Image viewport with editor-like zoom, pan and fit behavior."""
 
+    cursor_moved = Signal(float, float)
+    cursor_left = Signal()
+    view_changed = Signal(float, float, float)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setScene(QGraphicsScene(self))
         self._item = QGraphicsPixmapItem()
         self.scene().addItem(self._item)
+        crosshair_pen = QPen(QColor("#54a7ff"), 0)
+        crosshair_pen.setCosmetic(True)
+        self._crosshair_vertical = self.scene().addLine(0, 0, 0, 0, crosshair_pen)
+        self._crosshair_horizontal = self.scene().addLine(0, 0, 0, 0, crosshair_pen)
+        epiline_pen = QPen(QColor("#f0a35e"), 0, Qt.PenStyle.DashLine)
+        epiline_pen.setCosmetic(True)
+        self._epiline = self.scene().addLine(0, 0, 0, 0, epiline_pen)
+        self._crosshair_vertical.hide()
+        self._crosshair_horizontal.hide()
+        self._epiline.hide()
         self.setBackgroundBrush(QBrush(QColor("#0d0d0d")))
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
@@ -153,7 +198,10 @@ class ImageCanvas(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        self.viewport().setMouseTracking(True)
         self._user_zoomed = False
+        self._zoom_factor = 1.0
+        self._sync_guard = False
 
     def set_image(self, image) -> None:
         self._item.setPixmap(QPixmap.fromImage(image))
@@ -165,6 +213,7 @@ class ImageCanvas(QGraphicsView):
         if not self._item.pixmap().isNull():
             self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
         self._user_zoomed = False
+        self._zoom_factor = 1.0
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         if self._item.pixmap().isNull():
@@ -173,17 +222,85 @@ class ImageCanvas(QGraphicsView):
         next_scale = self.transform().m11() * factor
         if 0.02 <= next_scale <= 80:
             self.scale(factor, factor)
+            self._zoom_factor *= factor
             self._user_zoomed = True
+            self._emit_view_state()
         event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        super().mouseMoveEvent(event)
+        point = self.mapToScene(event.position().toPoint())
+        bounds = self._item.boundingRect()
+        if bounds.contains(point) and bounds.width() and bounds.height():
+            self.cursor_moved.emit(point.x() / bounds.width(), point.y() / bounds.height())
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._emit_view_state()
+
+    def leaveEvent(self, event) -> None:
+        self.cursor_left.emit()
+        super().leaveEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
         self.reset_view()
+        self._emit_view_state()
         event.accept()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if not self._user_zoomed:
             self.reset_view()
+
+    def _emit_view_state(self) -> None:
+        if self._sync_guard or self._item.pixmap().isNull():
+            return
+        bounds = self._item.boundingRect()
+        center = self.mapToScene(self.viewport().rect().center())
+        nx = center.x() / bounds.width() if bounds.width() else 0.5
+        ny = center.y() / bounds.height() if bounds.height() else 0.5
+        self.view_changed.emit(self._zoom_factor, nx, ny)
+
+    def apply_view_state(self, zoom_factor: float, center_x: float, center_y: float) -> None:
+        if self._item.pixmap().isNull():
+            return
+        self._sync_guard = True
+        try:
+            self.reset_view()
+            zoom_factor = max(0.02, min(80.0, zoom_factor))
+            if zoom_factor != 1.0:
+                self.scale(zoom_factor, zoom_factor)
+                self._user_zoomed = True
+            self._zoom_factor = zoom_factor
+            bounds = self._item.boundingRect()
+            self.centerOn(QPointF(center_x * bounds.width(), center_y * bounds.height()))
+        finally:
+            self._sync_guard = False
+
+    def set_crosshair(self, x: float, y: float, visible: bool) -> None:
+        bounds = self._item.boundingRect()
+        visible = visible and not self._item.pixmap().isNull()
+        if visible:
+            px = max(0.0, min(1.0, x)) * bounds.width()
+            py = max(0.0, min(1.0, y)) * bounds.height()
+            self._crosshair_vertical.setLine(px, 0, px, bounds.height())
+            self._crosshair_horizontal.setLine(0, py, bounds.width(), py)
+        self._crosshair_vertical.setVisible(visible)
+        self._crosshair_horizontal.setVisible(visible)
+
+    def set_epiline(self, line: tuple[float, float, float, float] | None) -> None:
+        bounds = self._item.boundingRect()
+        visible = line is not None and not self._item.pixmap().isNull()
+        if line is not None:
+            x1, y1, x2, y2 = line
+            self._epiline.setLine(
+                x1 * bounds.width(),
+                y1 * bounds.height(),
+                x2 * bounds.width(),
+                y2 * bounds.height(),
+            )
+        self._epiline.setVisible(visible)
 
 
 class TitleBar(QFrame):
@@ -199,8 +316,8 @@ class TitleBar(QFrame):
         self.setObjectName("titleBar")
         self.setFixedHeight(40)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(11, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setContentsMargins(11, 0, 6, 0)
+        layout.setSpacing(4)
 
         mark = QLabel("SS")
         mark.setObjectName("titleMark")
@@ -208,23 +325,20 @@ class TitleBar(QFrame):
         mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title = QLabel("Stereo Selector")
         title.setObjectName("titleBrand")
-        self.context = QLabel("图片筛选工作区")
+        self.context = QLabel("")
         self.context.setObjectName("titleContext")
         self.context.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.context.hide()
 
         self.settings_button = QPushButton("设置")
         self.settings_button.setObjectName("titleActionButton")
-        self.settings_button.setToolTip("打开设置")
         self.settings_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.minimize_button = WindowControlButton("minimize")
-        self.minimize_button.setToolTip("最小化")
         self.maximize_button = WindowControlButton("maximize")
-        self.maximize_button.setToolTip("最大化")
         self.close_button = WindowControlButton("close")
-        self.close_button.setToolTip("关闭")
         for button in (self.minimize_button, self.maximize_button, self.close_button):
-            button.setFixedSize(46, 39)
+            button.setFixedSize(40, 30)
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.minimize_button.clicked.connect(self.minimize_requested)
@@ -243,10 +357,10 @@ class TitleBar(QFrame):
 
     def set_context(self, text: str) -> None:
         self.context.setText(text)
+        self.context.setVisible(bool(text))
 
     def set_maximized(self, maximized: bool) -> None:
         self.maximize_button.set_maximized(maximized)
-        self.maximize_button.setToolTip("还原" if maximized else "最大化")
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -316,25 +430,41 @@ class PointCloudCanvas(QWidget):
         self.view.setCameraPosition(
             pos=QVector3D(float(self._center[0]), float(self._center[1]), float(self._center[2])),
             distance=self._distance,
-            elevation=0,
-            azimuth=90,
+            elevation=CAMERA_ALIGNED_ELEVATION,
+            azimuth=CAMERA_ALIGNED_AZIMUTH,
         )
 
 
 class MediaTile(QFrame):
     focus_requested = Signal(str)
+    cursor_moved = Signal(str, float, float)
+    cursor_left = Signal(str)
+    view_changed = Signal(str, float, float, float)
+    data_ready = Signal(str)
 
-    def __init__(self, modality: str, point_limit: int = 300_000, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        modality: str,
+        point_limit: int = 300_000,
+        parent: QWidget | None = None,
+        cloud_rotation: np.ndarray | None = None,
+        cloud_translation: np.ndarray | None = None,
+    ) -> None:
         super().__init__(parent)
         self.modality = modality
         self.point_limit = point_limit
+        self.cloud_rotation = cloud_rotation
+        self.cloud_translation = cloud_translation
         self._load_token = 0
         self._workers: dict[int, MediaLoadWorker] = {}
         self._worker_cache_keys: dict[int, tuple[str, int, int]] = {}
         self._cache: OrderedDict[tuple[str, int, int], object] = OrderedDict()
         self._current_path: Path | None = None
+        self.image_data: ImageData | None = None
+        self.depth_stats: DepthStats | None = None
         self._meta_text = ""
         self._disposed = False
+        self._content_animation: QPropertyAnimation | None = None
         self._loading_delay = QTimer(self)
         self._loading_delay.setSingleShot(True)
         self._loading_delay.setInterval(220)
@@ -373,6 +503,13 @@ class MediaTile(QFrame):
 
         self.stack = QStackedWidget()
         self.image_canvas = ImageCanvas()
+        self.image_canvas.cursor_moved.connect(
+            lambda x, y: self.cursor_moved.emit(self.modality, x, y)
+        )
+        self.image_canvas.cursor_left.connect(lambda: self.cursor_left.emit(self.modality))
+        self.image_canvas.view_changed.connect(
+            lambda zoom, x, y: self.view_changed.emit(self.modality, zoom, x, y)
+        )
         self.cloud_canvas = PointCloudCanvas() if modality == "ply" else None
         self.message = QLabel("")
         self.message.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -414,12 +551,17 @@ class MediaTile(QFrame):
         self._current_path = path
         self._loading_delay.stop()
         if path is None:
+            self.image_data = None
+            self.depth_stats = None
             self.spinner.stop()
             self._set_missing(True)
             self._set_meta("未匹配", "")
             self.message.setText("当前样本没有匹配到此类型文件")
             self.stack.setCurrentWidget(self.message)
             return
+        if self.modality != "ply":
+            self.image_data = None
+            self.depth_stats = None
         self._set_missing(False)
         self._set_meta(path.name, str(path))
         cache_key = self._cache_key(path)
@@ -432,7 +574,14 @@ class MediaTile(QFrame):
         self.loading_label.setText(f"正在加载 {path.name}")
         pool = QThreadPool.globalInstance()
         self._cancel_queued_workers(pool)
-        worker = MediaLoadWorker(token, self.modality, path, self.point_limit)
+        worker = MediaLoadWorker(
+            token,
+            self.modality,
+            path,
+            self.point_limit,
+            self.cloud_rotation,
+            self.cloud_translation,
+        )
         worker.signals.loaded.connect(self._load_finished)
         worker.signals.failed.connect(self._load_failed)
         self._workers[token] = worker
@@ -522,10 +671,19 @@ class MediaTile(QFrame):
                 self._set_meta(f"{path.name}  ·  {count:,} 点", str(path))
                 self.stack.setCurrentWidget(self.cloud_canvas)
             else:
-                image = result
+                image_data = result
+                if not isinstance(image_data, ImageData):
+                    raise TypeError("图片加载结果格式无效")
+                self.image_data = image_data
+                self.depth_stats = (
+                    analyze_depth(image_data.values) if self.modality == "depth_fsd" else None
+                )
+                image = image_data.image
                 self.image_canvas.set_image(image)
                 self._set_meta(f"{path.name}  ·  {image.width()}×{image.height()}", str(path))
                 self.stack.setCurrentWidget(self.image_canvas)
+                self._animate_image_arrival()
+                self.data_ready.emit(self.modality)
         except Exception as exc:
             self._show_load_error(path, str(exc))
 
@@ -542,6 +700,20 @@ class MediaTile(QFrame):
         self._set_missing(True)
         self.message.setText(f"无法预览\n{path.name}\n\n{error}")
         self.stack.setCurrentWidget(self.message)
+
+    def _animate_image_arrival(self) -> None:
+        if self._content_animation is not None:
+            self._content_animation.stop()
+        effect = QGraphicsOpacityEffect(self.image_canvas)
+        self.image_canvas.setGraphicsEffect(effect)
+        animation = QPropertyAnimation(effect, b"opacity", self.image_canvas)
+        animation.setDuration(110)
+        animation.setStartValue(0.9)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.finished.connect(lambda: self.image_canvas.setGraphicsEffect(None))
+        self._content_animation = animation
+        animation.start()
 
     def set_focused(self, focused: bool) -> None:
         if bool(self.property("focused")) == focused:
@@ -577,20 +749,16 @@ class DropHint(QFrame):
         mark.setObjectName("emptyMark")
         mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
         mark.setFixedSize(56, 56)
-        title = QLabel("打开一个双目图像项目")
+        title = QLabel("打开项目")
         title.setObjectName("emptyTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint = QLabel("将项目文件夹拖到窗口，或从本机选择文件夹")
+        hint = QLabel("拖放文件夹，或从本机选择")
         hint.setObjectName("emptyHint")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setWordWrap(True)
-        open_button = QPushButton("选择项目文件夹")
+        open_button = QPushButton("选择文件夹")
         open_button.setObjectName("primaryButton")
         open_button.clicked.connect(self.open_requested)
-        formats = QLabel("支持  left  ·  right  ·  depth_fsd  ·  depth_color  ·  ply")
-        formats.setObjectName("emptyFormats")
-        formats.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
         layout.addWidget(mark, 0, Qt.AlignmentFlag.AlignHCenter)
         layout.addSpacing(16)
         layout.addWidget(title)
@@ -598,8 +766,6 @@ class DropHint(QFrame):
         layout.addWidget(hint)
         layout.addSpacing(18)
         layout.addWidget(open_button, 0, Qt.AlignmentFlag.AlignHCenter)
-        layout.addSpacing(24)
-        layout.addWidget(formats)
 
 
 class NoViewsHint(QFrame):
@@ -608,11 +774,7 @@ class NoViewsHint(QFrame):
         self.setObjectName("noViewsHint")
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title = QLabel("尚未选择对比视图")
+        title = QLabel("选择视图")
         title.setObjectName("emptyTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint = QLabel("从左侧选择任意一种数据，或使用数字键 1–5")
-        hint.setObjectName("emptyHint")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
-        layout.addWidget(hint)
