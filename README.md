@@ -123,3 +123,18 @@ project/
 ```
 
 也识别 OpenCV 常见的 `M1`、`D1`、`M2`、`D2`、`R`、`T`、`F` 字段。`cloud_to_left` 会在显示前把 PLY 从其原坐标系变换到左目相机坐标系；平移单位和深度值单位应保持一致。
+
+## GitHub Actions 跨平台构建
+
+`.github/workflows/build-desktop.yml` 会在主分支更新、面向主分支的 PR、版本标签以及手动运行时执行测试并构建桌面包。v1.1 生成以下文件：
+
+| 平台 | 输出 |
+| --- | --- |
+| Windows x64 | `StereoSelector-v1.1.exe` |
+| macOS Intel | `StereoSelector-v1.1-macOS-x64.dmg` |
+| macOS Apple Silicon | `StereoSelector-v1.1-macOS-arm64.dmg` |
+| Linux x64 | `StereoSelector-v1.1-linux-x86_64.AppImage` |
+
+每次构建的文件会作为 Actions artifact 保留 30 天。推送与项目版本一致的 `v*` 标签时，工作流也会把四个平台包上传到已有 GitHub Release。若标签已经存在，可从 Actions 手动运行工作流并在 `release_tag` 中填写 `v1.1`。
+
+macOS 包目前使用临时签名，没有 Apple Developer ID 公证；首次打开时可能需要在系统“隐私与安全性”中确认。Linux AppImage 仍依赖目标机器提供可用的图形桌面、OpenGL 驱动和基础系统图形库。
