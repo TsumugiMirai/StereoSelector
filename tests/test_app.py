@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -178,7 +179,7 @@ def test_integrated_titlebar_window_controls(tmp_path: Path) -> None:
     window.show()
     app.processEvents()
     assert window.windowFlags() & Qt.WindowType.FramelessWindowHint
-    assert window._native_frame_applied
+    assert window._native_frame_applied is (sys.platform == "win32")
     assert not hasattr(window, "_resize_handles")
     assert window._resize_hit_test(101, 101, 100, 100, 900, 700, 12) == 13
     assert window._resize_hit_test(899, 400, 100, 100, 900, 700, 12) == 11
