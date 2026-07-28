@@ -133,8 +133,10 @@ project/
 | Windows x64 | `StereoSelector-v1.1.exe` |
 | macOS Intel | `StereoSelector-v1.1-macOS-x64.dmg` |
 | macOS Apple Silicon | `StereoSelector-v1.1-macOS-arm64.dmg` |
-| Linux x64 | `StereoSelector-v1.1-linux-x86_64.AppImage` |
+| Linux x64（Ubuntu 20.04 / glibc 2.31 及以上） | `StereoSelector-v1.1-linux-x86_64.AppImage` |
 
 每次构建的文件会作为 Actions artifact 保留 30 天。推送与项目版本一致的 `v*` 标签时，工作流也会把四个平台包上传到已有 GitHub Release。若标签已经存在，可从 Actions 手动运行工作流并在 `release_tag` 中填写 `v1.1`。
 
 macOS 包目前使用临时签名，没有 Apple Developer ID 公证；首次打开时可能需要在系统“隐私与安全性”中确认。Linux AppImage 仍依赖目标机器提供可用的图形桌面、OpenGL 驱动和基础系统图形库。
+
+Linux 包在官方 `ubuntu:20.04` 容器中使用 Python 3.11 和受约束的 PySide6 6.7.3 构建，并在 glibc 2.31 环境中完成单元测试和最终 AppImage 冒烟测试。它适用于 x86_64 架构的 Ubuntu 20.04 及更新版本；不支持 ARM64 或基于 musl libc 的发行版。

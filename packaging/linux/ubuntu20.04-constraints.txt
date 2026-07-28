@@ -1,0 +1,6 @@
+# PySide6 6.7.3 publishes manylinux_2_28 wheels, which remain compatible with
+# Ubuntu 20.04's glibc 2.31 while supporting Python 3.11.
+PySide6==6.7.3
+PySide6-Addons==6.7.3
+PySide6-Essentials==6.7.3
+shiboken6==6.7.3
