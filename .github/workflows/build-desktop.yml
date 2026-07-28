@@ -216,6 +216,9 @@ jobs:
       RELEASE_VERSION: ${{ needs.test.outputs.release_version }}
       DEBIAN_FRONTEND: noninteractive
       PYTHON_BIN: /opt/stereo-python/bin/python
+      PYTHON_VERSION: 3.11.15
+      PYTHON_SOURCE_SHA256: 272179ddd9a2e41a0fc8e42e33dfbdca0b3711aa5abf372d3f2d51543d09b625
+      LD_LIBRARY_PATH: /opt/python311/lib
     steps:
       - name: Install Ubuntu 20.04 build libraries
         run: |
@@ -223,19 +226,29 @@ jobs:
           apt-get update
           apt-get install --yes --no-install-recommends \
             binutils \
+            build-essential \
             ca-certificates \
             curl \
             file \
             git \
+            libbz2-dev \
             libdbus-1-3 \
             libegl1 \
+            libexpat1-dev \
+            libffi-dev \
             libfontconfig1 \
             libfuse2 \
+            libgdbm-dev \
             libgl1 \
             libgl1-mesa-dri \
             libglib2.0-0 \
             libglu1-mesa \
+            liblzma-dev \
+            libncursesw5-dev \
             libopengl0 \
+            libreadline-dev \
+            libsqlite3-dev \
+            libssl-dev \
             lsb-release \
             libx11-6 \
             libx11-xcb1 \
@@ -253,24 +266,36 @@ jobs:
             libxkbcommon-x11-0 \
             libxrender1 \
             mesa-utils \
-            software-properties-common \
             unzip \
+            uuid-dev \
             xauth \
             xdg-utils \
             xz-utils \
             xvfb \
+            zlib1g-dev \
             zstd
 
-      - name: Install Ubuntu 20.04 Python 3.11
+      - name: Build Python 3.11 on glibc 2.31
         run: |
           set -euo pipefail
-          add-apt-repository --yes ppa:deadsnakes/ppa
-          apt-get update
-          apt-get install --yes --no-install-recommends \
-            python3.11 \
-            python3.11-dev \
-            python3.11-venv
-          python3.11 -m venv /opt/stereo-python
+          python_archive="/tmp/Python-${PYTHON_VERSION}.tar.xz"
+          python_source="/tmp/Python-${PYTHON_VERSION}"
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --output "$python_archive" \
+            "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz"
+          printf '%s  %s\n' "$PYTHON_SOURCE_SHA256" "$python_archive" | sha256sum --check
+          tar -xf "$python_archive" -C /tmp
+          cd "$python_source"
+          ./configure \
+            --prefix=/opt/python311 \
+            --enable-shared \
+            --with-ensurepip=install
+          make -j"$(nproc)"
+          make install
+          /opt/python311/bin/python3.11 -m venv /opt/stereo-python
           "$PYTHON_BIN" -m pip install --upgrade pip
 
       - name: Check out source
