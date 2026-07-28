@@ -272,7 +272,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.31"
-          ldd --version | head -n 1
+          ldd --version
           python --version
 
       - name: Install constrained build dependencies
