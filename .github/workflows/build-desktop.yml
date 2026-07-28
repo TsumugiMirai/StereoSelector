@@ -235,6 +235,7 @@ jobs:
             libglib2.0-0 \
             libglu1-mesa \
             libopengl0 \
+            lsb-release \
             libx11-6 \
             libx11-xcb1 \
             libxcb-cursor0 \
