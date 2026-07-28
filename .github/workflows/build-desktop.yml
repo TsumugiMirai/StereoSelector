@@ -105,11 +105,6 @@ jobs:
             python_arch: arm64
             platform: macos
             package_suffix: macos-arm64
-          - label: Linux x64
-            runner: ubuntu-22.04
-            python_arch: x64
-            platform: linux
-            package_suffix: linux-x64
     runs-on: ${{ matrix.runner }}
     env:
       APP_NAME: ${{ needs.test.outputs.app_name }}
@@ -126,12 +121,6 @@ jobs:
           python-version: "3.12"
           architecture: ${{ matrix.python_arch }}
           cache: pip
-
-      - name: Install Linux build libraries
-        if: matrix.platform == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes libegl1 libfuse2 libgl1 libxkbcommon-x11-0 libxcb-cursor0
 
       - name: Install build dependencies
         run: |
@@ -189,9 +178,163 @@ jobs:
             "$package_path"
           echo "PACKAGE_PATH=$package_path" >> "$GITHUB_ENV"
 
-      - name: Prepare Linux AppImage
-        if: matrix.platform == 'linux'
+      - name: Verify package
         shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          package = Path(os.environ["PACKAGE_PATH"])
+          size = package.stat().st_size
+          if size < 1_000_000:
+              raise SystemExit(f"Package is unexpectedly small: {package} ({size} bytes)")
+          print(f"Verified {package}: {size} bytes")
+          PY
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.test.outputs.app_name }}-${{ matrix.package_suffix }}
+          path: ${{ env.PACKAGE_PATH }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  build-linux-ubuntu20:
+    name: Build Linux x64 (Ubuntu 20.04 / glibc 2.31)
+    needs: test
+    runs-on: ubuntu-22.04
+    container:
+      image: ubuntu:20.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      APP_NAME: ${{ needs.test.outputs.app_name }}
+      PROJECT_VERSION: ${{ needs.test.outputs.project_version }}
+      RELEASE_VERSION: ${{ needs.test.outputs.release_version }}
+      DEBIAN_FRONTEND: noninteractive
+      PYTHON_BIN: /opt/stereo-python/bin/python
+      PYTHON_VERSION: 3.11.15
+      PYTHON_SOURCE_SHA256: 272179ddd9a2e41a0fc8e42e33dfbdca0b3711aa5abf372d3f2d51543d09b625
+      LD_LIBRARY_PATH: /opt/python311/lib
+    steps:
+      - name: Install Ubuntu 20.04 build libraries
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            binutils \
+            build-essential \
+            ca-certificates \
+            curl \
+            file \
+            git \
+            libbz2-dev \
+            libdbus-1-3 \
+            libegl1 \
+            libexpat1-dev \
+            libffi-dev \
+            libfontconfig1 \
+            libfuse2 \
+            libgdbm-dev \
+            libgl1 \
+            libgl1-mesa-dri \
+            libglib2.0-0 \
+            libglu1-mesa \
+            liblzma-dev \
+            libncursesw5-dev \
+            libopengl0 \
+            libreadline-dev \
+            libsqlite3-dev \
+            libssl-dev \
+            lsb-release \
+            libx11-6 \
+            libx11-xcb1 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xfixes0 \
+            libxcb-xinerama0 \
+            libxcb-xkb1 \
+            libxi6 \
+            libxkbcommon-x11-0 \
+            libxrender1 \
+            mesa-utils \
+            unzip \
+            uuid-dev \
+            xauth \
+            xdg-utils \
+            xz-utils \
+            xvfb \
+            zlib1g-dev \
+            zstd
+
+      - name: Build Python 3.11 on glibc 2.31
+        run: |
+          set -euo pipefail
+          python_archive="/tmp/Python-${PYTHON_VERSION}.tar.xz"
+          python_source="/tmp/Python-${PYTHON_VERSION}"
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --output "$python_archive" \
+            "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz"
+          printf '%s  %s\n' "$PYTHON_SOURCE_SHA256" "$python_archive" | sha256sum --check
+          tar -xf "$python_archive" -C /tmp
+          cd "$python_source"
+          ./configure \
+            --prefix=/opt/python311 \
+            --enable-shared \
+            --with-ensurepip=install
+          make -j"$(nproc)"
+          make install
+          /opt/python311/bin/python3.11 -m venv /opt/stereo-python
+          "$PYTHON_BIN" -m pip install --upgrade pip
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Verify build environment
+        run: |
+          set -euo pipefail
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.31"
+          ldd --version
+          "$PYTHON_BIN" --version
+
+      - name: Install constrained build dependencies
+        run: |
+          set -euo pipefail
+          "$PYTHON_BIN" -m pip install \
+            --constraint packaging/linux/ubuntu20.04-constraints.txt \
+            ".[build,test]"
+          "$PYTHON_BIN" -c "import PySide6; print(f'PySide6 {PySide6.__version__}')"
+
+      - name: Run tests on glibc 2.31
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          "$PYTHON_BIN" -m pytest -q
+
+      - name: Build Linux executable
+        run: |
+          "$PYTHON_BIN" -m PyInstaller --noconfirm --clean StereoSelector.spec
+
+      - name: Verify bundled calibration files
+        run: |
+          set -euo pipefail
+          "$PYTHON_BIN" -m PyInstaller.utils.cliutils.archive_viewer \
+            -l "dist/${APP_NAME}" > build/pyinstaller-archive.txt
+          grep -F "calib2000_004_b" build/pyinstaller-archive.txt
+          grep -F "calib3000_003" build/pyinstaller-archive.txt
+
+      - name: Prepare Linux AppImage
         run: |
           set -euo pipefail
           app_dir="build/AppDir"
@@ -221,10 +364,27 @@ jobs:
           chmod +x "$package_path"
           echo "PACKAGE_PATH=$package_path" >> "$GITHUB_ENV"
 
-      - name: Verify package
-        shell: bash
+      - name: Create smoke-test dataset
         run: |
-          python - <<'PY'
+          "$PYTHON_BIN" scripts/create_smoke_dataset.py build/smoke-data
+
+      - name: Test AppImage on glibc 2.31
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          QT_OPENGL: software
+        run: |
+          set -euo pipefail
+          xvfb-run \
+            -a \
+            -s "-screen 0 1280x720x24" \
+            "$PACKAGE_PATH" \
+            --smoke-test \
+            build/smoke-data
+
+      - name: Verify Linux package
+        run: |
+          "$PYTHON_BIN" - <<'PY'
           import os
           from pathlib import Path
 
@@ -232,13 +392,13 @@ jobs:
           size = package.stat().st_size
           if size < 1_000_000:
               raise SystemExit(f"Package is unexpectedly small: {package} ({size} bytes)")
-          print(f"Verified {package}: {size} bytes")
+          print(f"Verified Ubuntu 20.04 package {package}: {size} bytes")
           PY
 
-      - name: Upload package artifact
+      - name: Upload Linux package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ needs.test.outputs.app_name }}-${{ matrix.package_suffix }}
+          name: ${{ needs.test.outputs.app_name }}-linux-x64
           path: ${{ env.PACKAGE_PATH }}
           if-no-files-found: error
           compression-level: 0
@@ -249,6 +409,7 @@ jobs:
     needs:
       - test
       - build
+      - build-linux-ubuntu20
     if: >-
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
       (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
