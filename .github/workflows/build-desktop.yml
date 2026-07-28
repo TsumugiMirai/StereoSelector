@@ -215,6 +215,7 @@ jobs:
       PROJECT_VERSION: ${{ needs.test.outputs.project_version }}
       RELEASE_VERSION: ${{ needs.test.outputs.release_version }}
       DEBIAN_FRONTEND: noninteractive
+      PYTHON_BIN: /opt/stereo-python/bin/python
     steps:
       - name: Install Ubuntu 20.04 build libraries
         run: |
@@ -252,6 +253,7 @@ jobs:
             libxkbcommon-x11-0 \
             libxrender1 \
             mesa-utils \
+            software-properties-common \
             unzip \
             xauth \
             xdg-utils \
@@ -259,43 +261,50 @@ jobs:
             xvfb \
             zstd
 
+      - name: Install Ubuntu 20.04 Python 3.11
+        run: |
+          set -euo pipefail
+          add-apt-repository --yes ppa:deadsnakes/ppa
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            python3.11 \
+            python3.11-dev \
+            python3.11-venv
+          python3.11 -m venv /opt/stereo-python
+          "$PYTHON_BIN" -m pip install --upgrade pip
+
       - name: Check out source
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          architecture: x64
 
       - name: Verify build environment
         run: |
           set -euo pipefail
           test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.31"
           ldd --version
-          python --version
+          "$PYTHON_BIN" --version
 
       - name: Install constrained build dependencies
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install \
+          "$PYTHON_BIN" -m pip install \
             --constraint packaging/linux/ubuntu20.04-constraints.txt \
             ".[build,test]"
-          python -c "import PySide6; print(f'PySide6 {PySide6.__version__}')"
+          "$PYTHON_BIN" -c "import PySide6; print(f'PySide6 {PySide6.__version__}')"
 
       - name: Run tests on glibc 2.31
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest -q
+        run: |
+          "$PYTHON_BIN" -m pytest -q
 
       - name: Build Linux executable
-        run: python -m PyInstaller --noconfirm --clean StereoSelector.spec
+        run: |
+          "$PYTHON_BIN" -m PyInstaller --noconfirm --clean StereoSelector.spec
 
       - name: Verify bundled calibration files
         run: |
           set -euo pipefail
-          python -m PyInstaller.utils.cliutils.archive_viewer \
+          "$PYTHON_BIN" -m PyInstaller.utils.cliutils.archive_viewer \
             -l "dist/${APP_NAME}" > build/pyinstaller-archive.txt
           grep -F "calib2000_004_b" build/pyinstaller-archive.txt
           grep -F "calib3000_003" build/pyinstaller-archive.txt
@@ -331,7 +340,8 @@ jobs:
           echo "PACKAGE_PATH=$package_path" >> "$GITHUB_ENV"
 
       - name: Create smoke-test dataset
-        run: python scripts/create_smoke_dataset.py build/smoke-data
+        run: |
+          "$PYTHON_BIN" scripts/create_smoke_dataset.py build/smoke-data
 
       - name: Test AppImage on glibc 2.31
         env:
@@ -349,7 +359,7 @@ jobs:
 
       - name: Verify Linux package
         run: |
-          python - <<'PY'
+          "$PYTHON_BIN" - <<'PY'
           import os
           from pathlib import Path
 
