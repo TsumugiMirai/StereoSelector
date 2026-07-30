@@ -5,6 +5,8 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
@@ -26,6 +28,7 @@ from stereo_selector.settings import (
     ToggleSwitch,
     reserved_shortcut_actions,
 )
+from stereo_selector.theme import PALETTES, style_for
 
 
 def _make_project(root: Path) -> Path:
@@ -59,7 +62,7 @@ def test_empty_startup_stays_idle_without_open_dialog(monkeypatch) -> None:
     assert window.manual_mapping_button.isHidden()
     assert window.modes_panel.isHidden()
     assert window.quality_panel.isHidden()
-    assert window.review_panel.isHidden()
+    assert not hasattr(window, "review_panel")
     assert window.output_panel.isHidden()
     assert window.reset_button.isHidden()
     assert window.review_bar.isHidden()
@@ -73,6 +76,60 @@ def test_application_icon_asset_is_available() -> None:
     assert app is not None
     assert asset_path("app_icon.png").is_file()
     assert not application_icon().isNull()
+
+
+def test_ui_design_tokens_cover_both_themes() -> None:
+    required = {
+        "window",
+        "surface",
+        "panel",
+        "border",
+        "border_strong",
+        "text",
+        "text_secondary",
+        "hover",
+        "pressed",
+        "focus",
+        "accent",
+        "success",
+        "warning",
+        "danger",
+    }
+    for theme in ("dark", "light"):
+        assert required <= PALETTES[theme].keys()
+        stylesheet = style_for(theme)
+        assert "$" not in stylesheet
+        assert '"Segoe UI Variable Text"' in stylesheet
+        assert "QFrame#commandSurface" in stylesheet
+
+
+def test_primary_actions_share_the_integrated_title_bar() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+
+    assert window.title_bar.height() == 40
+    assert window.workspace_header.isHidden()
+    assert window.workspace_header.height() == 0
+    assert window.mode_picker.parentWidget() is window.title_bar.actions
+    assert window.open_button.parentWidget() is window.title_bar.actions
+    assert window.layout_picker.parentWidget() is window.title_bar.actions
+    assert window.header_settings_button.parentWidget() is window.title_bar.actions
+    assert window.media_grid.contentsMargins().left() == 8
+    assert window.media_grid.spacing() == 8
+
+    window.open_settings()
+    app.processEvents()
+    assert window.title_bar.actions.isHidden()
+    assert window._settings_page is not None
+    assert window.title_bar.context.text() == "设置"
+    assert window._settings_page.header.isHidden()
+    window._settings_page.reject()
+    app.processEvents()
+    assert not window.title_bar.actions.isHidden()
+    assert window.app_status_bar.isHidden()
+    window.close()
 
 
 def test_review_focus_and_accept_flow(tmp_path: Path) -> None:
@@ -95,6 +152,8 @@ def test_review_focus_and_accept_flow(tmp_path: Path) -> None:
     assert window.accept_button.text() == window.preferences.button_labels["accept"]
     assert window._shortcut_text("previous") in window.previous_button.toolTip()
     assert window._shortcut_text("accept") in window.accept_button.toolTip()
+    assert window.product_mode == "view"
+    assert window.review_controls.isHidden()
 
     window.focus_modality("left")
     assert window.focused_modality == "left"
@@ -104,11 +163,12 @@ def test_review_focus_and_accept_flow(tmp_path: Path) -> None:
     assert all(not tile.isHidden() for tile in window.tiles.values())
 
     first = window.dataset.samples[0]
+    window.set_product_mode("review")
     window.accept_current()
     assert first.key in window.accepted
     assert window.current_index == 1
     assert (project.parent / "capture_select" / "left" / "frame_0001.png").exists()
-    assert window.accepted_count_label.text() == "1"
+    assert not hasattr(window, "accepted_count_label")
     review_document = json.loads(
         (project.parent / "capture_select" / "stereo_selector_review.json").read_text(encoding="utf-8")
     )
@@ -121,6 +181,7 @@ def test_existing_output_is_restored_as_accepted(tmp_path: Path) -> None:
     project = _make_project(tmp_path / "capture")
     window = MainWindow(project)
     app.processEvents()
+    window.set_product_mode("review")
     window.accept_current()
     window.close()
 
@@ -138,6 +199,7 @@ def test_accepted_sample_changes_the_entire_review_bar_state(tmp_path: Path) -> 
     window = MainWindow(project)
     window.preferences.auto_advance = False
     app.processEvents()
+    window.set_product_mode("review")
 
     assert window.review_bar.property("reviewState") == "pending"
     assert not window.sample_status.property("accepted")
@@ -151,7 +213,7 @@ def test_accepted_sample_changes_the_entire_review_bar_state(tmp_path: Path) -> 
 
     window.next_sample()
     assert window.review_bar.property("reviewState") == "pending"
-    assert window.sample_status.text() == "待审阅"
+    assert window.sample_status.text() == "待定"
     window.close()
 
 
@@ -273,6 +335,12 @@ def test_preferences_round_trip(tmp_path: Path) -> None:
         theme="light",
         auto_advance=False,
         point_limit=150_000,
+        cloud_cam_offset=0.1,
+        cloud_grid=4,
+        cloud_dot_radius=2.5,
+        cloud_z_max=24.5,
+        cloud_tau_rel=0.2,
+        cloud_occlusion=False,
         button_labels={"previous": "向前", "next": "向后", "accept": "保留"},
         shortcuts={"previous": "A", "next": "D", "accept": "Space", "focus": "F", "reset": "R"},
     )
@@ -285,12 +353,22 @@ def test_invalid_persisted_preferences_are_sanitized(tmp_path: Path) -> None:
     settings = QSettings(str(tmp_path / "broken.ini"), QSettings.Format.IniFormat)
     settings.setValue("preferences/theme", "unknown")
     settings.setValue("preferences/point_limit", -1)
+    settings.setValue("preferences/point_cloud/cam_offset", float("nan"))
+    settings.setValue("preferences/point_cloud/grid", -1)
+    settings.setValue("preferences/point_cloud/dot_radius", float("nan"))
+    settings.setValue("preferences/point_cloud/ply_z_max", float("nan"))
+    settings.setValue("preferences/point_cloud/tau_rel", float("nan"))
     settings.setValue("preferences/buttons/accept", "   ")
     settings.setValue("preferences/shortcuts/previous", "Ctrl+O")
     settings.setValue("preferences/shortcuts/next", "Ctrl+O")
     loaded = AppPreferences.load(settings)
     assert loaded.theme == "dark"
     assert loaded.point_limit == 50_000
+    assert loaded.cloud_cam_offset == 0.05
+    assert loaded.cloud_grid == 1
+    assert loaded.cloud_dot_radius == 1.0
+    assert loaded.cloud_z_max == 10.0
+    assert loaded.cloud_tau_rel == 0.15
     assert loaded.button_labels["accept"] == "接受"
     assert loaded.shortcuts == {
         "previous": "Left",
@@ -299,6 +377,29 @@ def test_invalid_persisted_preferences_are_sanitized(tmp_path: Path) -> None:
         "focus": "F",
         "reset": "R",
     }
+
+
+def test_former_point_cloud_defaults_are_migrated_once(tmp_path: Path) -> None:
+    settings = QSettings(str(tmp_path / "legacy-cloud.ini"), QSettings.Format.IniFormat)
+    settings.setValue("preferences/point_cloud/grid", 6)
+    settings.setValue("preferences/point_cloud/dot_radius", 2.0)
+    settings.setValue("preferences/point_cloud/ply_z_max", 15.0)
+
+    migrated = AppPreferences.load(settings)
+
+    assert migrated.cloud_grid == 5
+    assert migrated.cloud_dot_radius == 1.0
+    assert migrated.cloud_z_max == 10.0
+    migrated.save(settings)
+    settings.setValue("preferences/point_cloud/grid", 6)
+    settings.setValue("preferences/point_cloud/dot_radius", 2.0)
+    settings.setValue("preferences/point_cloud/ply_z_max", 15.0)
+
+    customized = AppPreferences.load(settings)
+
+    assert customized.cloud_grid == 6
+    assert customized.cloud_dot_radius == 2.0
+    assert customized.cloud_z_max == 15.0
 
 
 def test_legacy_default_button_labels_are_simplified(tmp_path: Path) -> None:
@@ -325,6 +426,12 @@ def test_settings_use_consistent_selection_controls() -> None:
     assert isinstance(dialog.auto_advance_check, ToggleSwitch)
     assert isinstance(dialog.calibration_combo, ChoiceButton)
     assert not dialog.auto_advance_check.isChecked()
+    assert dialog.cloud_cam_offset_spin.value() == 0.05
+    assert dialog.cloud_grid_spin.value() == 5
+    assert dialog.cloud_dot_radius_spin.value() == 1.0
+    assert dialog.cloud_z_max_spin.value() == 10.0
+    assert dialog.cloud_tau_rel_spin.value() == 0.15
+    assert dialog.cloud_occlusion_check.isChecked()
     assert dialog.navigation.count() == 6
     assert dialog.calibration_combo.count() == 3
     assert dialog.calibration_combo.itemText(1).startswith("libra2000")
@@ -350,7 +457,9 @@ def test_settings_open_as_an_integrated_main_window_page() -> None:
     margins = dialog._window_layout.contentsMargins()
     assert (margins.left(), margins.top(), margins.right(), margins.bottom()) == (0, 0, 0, 0)
     assert dialog.dialog_surface.property("embedded")
-    assert window.title_bar.context.isHidden()
+    assert window.title_bar.context.text() == "设置"
+    assert not window.title_bar.context.isHidden()
+    assert dialog.header.isHidden()
     assert window.title_bar.settings_button.isHidden()
     assert window.app_status_bar.isHidden()
 
@@ -358,7 +467,8 @@ def test_settings_open_as_an_integrated_main_window_page() -> None:
     app.processEvents()
     assert window._settings_page is None
     assert window.page_stack.currentWidget() is window.main_page
-    assert not window.title_bar.settings_button.isHidden()
+    assert window.title_bar.settings_button.isHidden()
+    assert not window.header_settings_button.isHidden()
     window.close()
 
 
@@ -428,6 +538,8 @@ def test_custom_output_is_saved_per_project_and_restored(tmp_path: Path) -> None
     assert window.dataset is not None
     assert window.dataset.output_root == custom_output.resolve()
     assert window.output_label.text() == str(custom_output.resolve())
+    assert not (custom_output / "stereo_selector_review.json").exists()
+    window.set_product_mode("review")
     assert (custom_output / "stereo_selector_review.json").is_file()
     window.accept_current()
     assert (custom_output / "left" / "frame_0001.png").is_file()
@@ -443,6 +555,7 @@ def test_configure_output_updates_active_project_without_moving_old_files(
     selected_output = (tmp_path / "chosen" / "named_output").resolve()
     window = MainWindow(project)
     app.processEvents()
+    window.set_product_mode("review")
     window.settings = QSettings(str(tmp_path / "output.ini"), QSettings.Format.IniFormat)
     old_output = window.dataset.output_root
 
@@ -470,6 +583,7 @@ def test_annotation_button_reflects_saved_tags_and_note(tmp_path: Path) -> None:
     project = _make_project(tmp_path / "capture")
     window = MainWindow(project)
     app.processEvents()
+    window.set_product_mode("review")
     assert window.review_store is not None
     sample = window.dataset.samples[0]
 
@@ -490,8 +604,14 @@ def test_inspection_tools_link_images_and_report_depth_quality(tmp_path: Path) -
     depth = project / "depth_fsd" / "frame_0001.png"
     depth.parent.mkdir()
     Image.fromarray(np.array([[0, 1000], [2000, 5000]], dtype=np.uint16)).save(depth)
+    pseudo = project / "depth_color" / "frame_0001.png"
+    pseudo.parent.mkdir()
+    Image.new("RGB", (32, 24), "orange").save(pseudo)
     window = MainWindow(project)
     window.show()
+    app.processEvents()
+    window.set_product_mode("review")
+    QThreadPool.globalInstance().waitForDone(5000)
     app.processEvents()
     QThreadPool.globalInstance().waitForDone(5000)
     app.processEvents()
@@ -500,6 +620,11 @@ def test_inspection_tools_link_images_and_report_depth_quality(tmp_path: Path) -
     assert window.overlay_button.isEnabled()
     assert window.title_bar.minimize_button.toolTip() == ""
     assert window.title_bar.maximize_button.toolTip() == ""
+    # Depth quality loads even when raw depth is not a visible comparison tile.
+    assert not window.checkboxes["depth_fsd"].isChecked()
+    assert "范围" in window.depth_quality_label.text()
+    assert "零值" in window.depth_quality_label.text()
+    assert "（" not in window.depth_quality_label.text()
     window.checkboxes["depth_fsd"].setChecked(True)
     QThreadPool.globalInstance().waitForDone(5000)
     app.processEvents()
@@ -507,10 +632,21 @@ def test_inspection_tools_link_images_and_report_depth_quality(tmp_path: Path) -
     assert "零值" in window.depth_quality_label.text()
 
     window.crosshair_button.setChecked(True)
+    assert (
+        window.tiles["left"].image_canvas.viewport().cursor().shape()
+        == Qt.CursorShape.BlankCursor
+    )
     window._media_cursor_moved("left", 0.5, 0.5)
     assert "RGB" in window.cursor_info.text()
     assert "深度" in window.cursor_info.text()
     assert window.tiles["left"].image_canvas._crosshair_vertical.isVisible()
+
+    window.checkboxes["depth_color"].setChecked(True)
+    QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    window._media_cursor_moved("depth_color", 0.5, 0.5)
+    assert "RGB" in window.cursor_info.text()
+    assert "深度" in window.cursor_info.text()
 
     window.epiline_button.setChecked(True)
     window._media_cursor_moved("left", 0.5, 0.5)
@@ -523,6 +659,103 @@ def test_inspection_tools_link_images_and_report_depth_quality(tmp_path: Path) -
     annotation_center = window.annotation_button.mapTo(window, window.annotation_button.rect().center()).y()
     accept_center = window.accept_button.mapTo(window, window.accept_button.rect().center()).y()
     assert abs(annotation_center - accept_center) <= 1
+    window.crosshair_button.setChecked(False)
+    assert (
+        window.tiles["left"].image_canvas.viewport().cursor().shape()
+        == Qt.CursorShape.OpenHandCursor
+    )
+    window.close()
+
+
+def test_cached_depth_quality_is_not_overwritten_by_loading_state(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    project = _make_project(tmp_path / "capture")
+    depth_dir = project / "depth_fsd"
+    depth_dir.mkdir()
+    Image.fromarray(np.array([[0, 1000], [2000, 5000]], dtype=np.uint16)).save(
+        depth_dir / "frame_0001.png"
+    )
+    Image.fromarray(np.array([[0, 3000], [4000, 65535]], dtype=np.uint16)).save(
+        depth_dir / "frame_0002.png"
+    )
+    window = MainWindow(project)
+    window.show()
+    app.processEvents()
+    QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    window.next_sample()
+    QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    assert "65535" in window.depth_quality_label.text()
+
+    window.previous_sample()
+
+    assert "正在计算" not in window.depth_quality_label.text()
+    assert "1000" in window.depth_quality_label.text()
+    window.close()
+
+
+def test_timeline_playback_advances_loaded_frames_and_stops_at_end(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    project = _make_project(tmp_path / "capture")
+    window = MainWindow(project)
+    window.show()
+    app.processEvents()
+    QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    window.playback_speed.setCurrentIndex(window.playback_speed.findData(0.5))
+    assert not window.timeline.hasTracking()
+    window.toggle_playback()
+
+    assert window._playback_timer.isActive()
+    assert window.playback_button.playing
+    window._playback_tick()
+    assert window.current_index == 1
+
+    QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    window._playback_tick()
+
+    assert not window._playback_timer.isActive()
+    assert not window.playback_button.playing
+    assert window.current_index == 1
+    window.close()
+
+
+def test_sidebar_and_inspection_toolbar_fold_with_reversible_animation(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    project = _make_project(tmp_path / "capture")
+    window = MainWindow(project)
+    window.show()
+    app.processEvents()
+
+    assert window.sidebar_panel.isHidden()
+    assert not window.sidebar.isHidden()
+    window.toggle_sidebar()
+    QTest.qWait(240)
+    assert not window.sidebar_panel.isHidden()
+    assert window.sidebar.width() >= 238
+    window.toggle_sidebar()
+    QTest.qWait(240)
+    assert window.sidebar_panel.isHidden()
+    assert not window.sidebar.isHidden()
+    assert window.sidebar.width() <= 42
+
+    window.toggle_topbar()
+    QTest.qWait(220)
+    assert window.inspection_bar.isHidden()
+    assert window.topbar_button._direction == "down"
+    window.toggle_topbar()
+    QTest.qWait(220)
+    assert not window.inspection_bar.isHidden()
+    assert window.inspection_bar.height() > 0
+    assert window.topbar_button._direction == "up"
     window.close()
 
 
@@ -546,6 +779,81 @@ def test_main_page_can_switch_builtin_calibration_per_project(tmp_path: Path) ->
     prefix = window._matching_settings_prefix(project.resolve())
     assert window.settings.value(f"{prefix}/calibration_id") == "builtin:libra3000"
     assert not hasattr(window, "calibration_button")
+    window.close()
+
+
+def test_product_mode_defaults_to_view_and_is_remembered_per_project(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    project = _make_project(tmp_path / "capture")
+    settings_path = tmp_path / "mode.ini"
+    window = MainWindow()
+    window.settings = QSettings(str(settings_path), QSettings.Format.IniFormat)
+    window.load_project(project)
+
+    assert window.product_mode == "view"
+    assert window.review_controls.isHidden()
+    assert window.review_store is None
+    assert not (project.parent / "capture_select" / "stereo_selector_review.json").exists()
+
+    window.set_product_mode("review")
+    assert not window.review_controls.isHidden()
+    assert window.review_store is not None
+    window.close()
+
+    reopened = MainWindow()
+    reopened.settings = QSettings(str(settings_path), QSettings.Format.IniFormat)
+    reopened.load_project(project)
+
+    assert reopened.product_mode == "review"
+    assert not reopened.review_controls.isHidden()
+    reopened.close()
+
+
+def test_review_mode_supports_rejected_and_pending_states(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    project = _make_project(tmp_path / "capture")
+    window = MainWindow(project)
+    app.processEvents()
+    window.set_product_mode("review")
+    window.preferences.auto_advance = False
+
+    window.set_review_status("rejected")
+    sample = window.dataset.samples[0]
+    assert window.review_store.get(sample)["status"] == "rejected"
+    assert window.review_bar.property("reviewState") == "rejected"
+    assert window.sample_status.text() == "已拒绝"
+
+    window.set_review_status("pending")
+    assert window.review_store.get(sample)["status"] == "pending"
+    assert window.review_bar.property("reviewState") == "pending"
+    window.close()
+
+
+def test_compact_view_chrome_and_analysis_inspector(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    project = _make_project(tmp_path / "capture")
+    window = MainWindow(project)
+    window.show()
+    QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    assert window.sidebar.width() <= 42
+    window.open_inspector()
+    app.processEvents()
+    assert window.inspector.isVisible()
+    assert "均值" in window.inspector.stats_label.text()
+
+    window.toggle_chrome()
+    assert window._chrome_hidden
+    assert window.title_bar.isHidden()
+    assert window.review_bar.isHidden()
+    window.toggle_chrome()
+    assert not window._chrome_hidden
+    assert not window.title_bar.isHidden()
     window.close()
 
 

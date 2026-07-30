@@ -115,7 +115,7 @@ class ReviewStore:
         self.save()
 
     def set_status(self, sample: Sample, status: str) -> None:
-        if status not in {"pending", "accepted"}:
+        if status not in {"pending", "accepted", "rejected"}:
             raise ValueError(f"不支持的审核状态：{status}")
         record = self._record_for(sample)
         record["status"] = status
@@ -130,7 +130,7 @@ class ReviewStore:
             copied = sample_is_copied(self.dataset, sample)
             record = self.records.get(sample.key)
             recorded_status = str(record.get("status", "pending")) if record else "pending"
-            if copied:
+            if copied and (record is None or recorded_status == "accepted"):
                 accepted.add(sample.key)
                 if recorded_status != "accepted":
                     record = self._record_for(sample)
@@ -179,7 +179,7 @@ class _BaseDialog(ShadowDialog):
         header = DialogHeader()
         header.setObjectName("settingsHeader")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(18, 0, 6, 0)
+        header_layout.setContentsMargins(14, 0, 5, 0)
         heading = QLabel(title)
         heading.setObjectName("settingsTitle")
         close = DialogCloseButton()
@@ -193,7 +193,7 @@ class _BaseDialog(ShadowDialog):
         footer = QFrame()
         footer.setObjectName("settingsFooter")
         layout = QHBoxLayout(footer)
-        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setContentsMargins(12, 8, 12, 8)
         cancel = QPushButton("取消")
         cancel.clicked.connect(self.reject)
         accept = QPushButton(accept_text)
@@ -221,8 +221,8 @@ class OutputSettingsDialog(_BaseDialog):
         body = QWidget()
         body.setObjectName("settingsPages")
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(30, 26, 30, 26)
-        layout.setSpacing(10)
+        layout.setContentsMargins(24, 22, 24, 24)
+        layout.setSpacing(8)
         title = QLabel("保存位置")
         title.setObjectName("settingsPageTitle")
         layout.addWidget(title)
@@ -231,7 +231,7 @@ class OutputSettingsDialog(_BaseDialog):
         parent_row = QFrame()
         parent_row.setObjectName("settingRow")
         parent_layout = QHBoxLayout(parent_row)
-        parent_layout.setContentsMargins(14, 10, 10, 10)
+        parent_layout.setContentsMargins(2, 10, 2, 10)
         parent_label = QLabel("输出位置")
         parent_label.setObjectName("settingRowTitle")
         parent_label.setFixedWidth(90)
@@ -247,7 +247,7 @@ class OutputSettingsDialog(_BaseDialog):
         name_row = QFrame()
         name_row.setObjectName("settingRow")
         name_layout = QHBoxLayout(name_row)
-        name_layout.setContentsMargins(14, 10, 10, 10)
+        name_layout.setContentsMargins(2, 10, 2, 10)
         name_label = QLabel("文件夹名称")
         name_label.setObjectName("settingRowTitle")
         name_label.setFixedWidth(90)
@@ -346,8 +346,8 @@ class AnnotationDialog(_BaseDialog):
         body = QWidget()
         body.setObjectName("settingsPages")
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(30, 24, 30, 24)
-        layout.setSpacing(9)
+        layout.setContentsMargins(24, 22, 24, 24)
+        layout.setSpacing(8)
         title = QLabel(sample.display_name)
         title.setObjectName("settingsPageTitle")
         layout.addWidget(title)
@@ -359,9 +359,9 @@ class AnnotationDialog(_BaseDialog):
         tag_frame = QFrame()
         tag_frame.setObjectName("settingRow")
         tag_layout = QGridLayout(tag_frame)
-        tag_layout.setContentsMargins(14, 11, 14, 11)
-        tag_layout.setHorizontalSpacing(18)
-        tag_layout.setVerticalSpacing(8)
+        tag_layout.setContentsMargins(2, 8, 2, 10)
+        tag_layout.setHorizontalSpacing(16)
+        tag_layout.setVerticalSpacing(6)
         selected = set(tags)
         self.tag_checks: dict[str, QCheckBox] = {}
         for index, tag in enumerate(DEFECT_TAGS):

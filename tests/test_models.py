@@ -74,6 +74,34 @@ def test_camel_case_capture_names_form_complete_groups(tmp_path: Path) -> None:
     assert all(len(sample.files) == 5 for sample in dataset.samples)
 
 
+def test_capture_ordinal_matches_left_and_right_with_split_timestamps(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "capture"
+    patterns = {
+        "left": "{i}_Left_remap_{left_stamp}_0_0_0_0.png",
+        "right": "{i}_Right_remap_{right_stamp}_0_0_0_0.png",
+        "depth_fsd": "{i}_Left_remap_{left_stamp}_0_0_0_0_depth.png",
+        "depth_vis": "{i}_Left_remap_{left_stamp}_0_0_0_0_depth_vis.png",
+        "ply": "{i}_Left_remap_{left_stamp}_0_0_0_0_pointcloud.ply",
+    }
+    for index in range(3):
+        values = {
+            "i": index,
+            "left_stamp": 1783241071537952 + index * 1000,
+            "right_stamp": 1783241071538199 + index * 1000,
+        }
+        for folder, pattern in patterns.items():
+            path = root / folder / pattern.format(**values)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x")
+
+    dataset = DatasetScanner().scan(root)
+
+    assert len(dataset.samples) == 3
+    assert all(set(sample.files) == set(dataset.available_modalities) for sample in dataset.samples)
+
+
 def test_manual_directories_can_force_positional_matching(tmp_path: Path) -> None:
     root = tmp_path / "capture"
     left_dir = root / "camera_a"
