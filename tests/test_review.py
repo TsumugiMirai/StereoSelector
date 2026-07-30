@@ -9,7 +9,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QDialog
 from PySide6.QtGui import QColor, QImage
 
-from stereo_selector.inspection import StereoOverlayDialog
+import numpy as np
+
+from stereo_selector.calibration import CalibrationData, CameraCalibration
+from stereo_selector.inspection import StereoOverlayDialog, rectify_stereo_images
 from stereo_selector.models import DatasetScanner, copy_sample
 from stereo_selector.review import AnnotationDialog, MANIFEST_FILENAME, OutputSettingsDialog, ReviewStore
 
@@ -43,6 +46,21 @@ def test_review_store_persists_annotations_and_acceptance(tmp_path: Path) -> Non
     assert record["defect_tags"] == ["模糊", "自定义"]
     assert record["note"] == "左上角需要复查"
     assert ReviewStore(dataset).reconcile() == {sample.key}
+
+
+def test_rejected_status_remains_authoritative_when_old_export_files_exist(
+    tmp_path: Path,
+) -> None:
+    dataset = _make_dataset(tmp_path)
+    sample = dataset.samples[0]
+    store = ReviewStore(dataset)
+    copy_sample(dataset, sample)
+    store.set_status(sample, "rejected")
+
+    reopened = ReviewStore(dataset)
+
+    assert reopened.reconcile() == set()
+    assert reopened.get(sample)["status"] == "rejected"
 
 
 def test_output_settings_dialog_builds_custom_path(tmp_path: Path) -> None:
@@ -99,3 +117,53 @@ def test_stereo_overlay_slider_blends_loaded_images() -> None:
     assert right_pixel.blue() > right_pixel.red()
     dialog.close()
     assert app is not None
+
+
+def test_stereo_difference_view_uses_absolute_rgb_difference() -> None:
+    app = QApplication.instance() or QApplication([])
+    left = QImage(2, 2, QImage.Format.Format_RGB32)
+    right = QImage(2, 2, QImage.Format.Format_RGB32)
+    left.fill(QColor(200, 20, 10))
+    right.fill(QColor(50, 30, 40))
+
+    dialog = StereoOverlayDialog(left, right, mode="difference")
+    pixel = dialog.canvas._item.pixmap().toImage().pixelColor(0, 0)
+
+    assert pixel.getRgb()[:3] == (150, 10, 30)
+    assert dialog.controls.isHidden()
+    dialog.close()
+    assert app is not None
+
+
+def test_rectified_toggle_preserves_zero_distortion_pair() -> None:
+    left = QImage(8, 6, QImage.Format.Format_RGB32)
+    right = QImage(8, 6, QImage.Format.Format_RGB32)
+    left.fill(QColor(20, 40, 60))
+    right.fill(QColor(80, 100, 120))
+    camera = CameraCalibration(
+        np.array([[10.0, 0.0, 4.0], [0.0, 10.0, 3.0], [0.0, 0.0, 1.0]]),
+        np.zeros(5),
+        8,
+        6,
+    )
+    calibration = CalibrationData(
+        Path("test.json"),
+        camera,
+        camera,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+    rectified_left, rectified_right = rectify_stereo_images(
+        left,
+        right,
+        calibration,
+    )
+
+    assert rectified_left.size() == left.size()
+    assert rectified_right.size() == right.size()
+    assert rectified_left.pixelColor(4, 3).getRgb()[:3] == (20, 40, 60)
+    assert rectified_right.pixelColor(4, 3).getRgb()[:3] == (80, 100, 120)

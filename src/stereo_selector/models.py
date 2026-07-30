@@ -23,6 +23,8 @@ _TOKEN_RE = re.compile(
     r"(?i)(?:^|[_\-. ])(?:left|right|rgb|depth|fsd|color|colour|raw|vis|ply|pointcloud|point_cloud)(?=$|[_\-. ])"
 )
 _NATURAL_RE = re.compile(r"(\d+)")
+_SEQUENCE_PREFIX_RE = re.compile(r"^(\d+)(?:[_\-. ])")
+_LONG_TIMESTAMP_RE = re.compile(r"(?:^|[_\-. ])\d{10,}(?=$|[_\-. ])")
 _MODALITY_HINTS = {
     "left": ("left", "cam_l", "camera_l", "cam0", "camera0", "左目", "左相机"),
     "right": ("right", "cam_r", "camera_r", "cam1", "camera1", "右目", "右相机"),
@@ -64,6 +66,19 @@ def normalized_sample_key(relative_file: Path) -> str:
         cleaned = re.sub(r"[_\-.]+", "_", cleaned).strip("_")
         normalized.append(cleaned or part.casefold())
     return "/".join(normalized)
+
+
+def _sequence_alignment_key(relative_file: Path) -> str | None:
+    """Return a stable capture ordinal for stereo files with split timestamps."""
+    prefix = _SEQUENCE_PREFIX_RE.match(relative_file.stem)
+    if prefix is None or _LONG_TIMESTAMP_RE.search(relative_file.stem) is None:
+        return None
+    scene = "/".join(
+        re.sub(r"[_\-. ]+", "_", part.casefold()).strip("_")
+        for part in relative_file.parent.parts
+    )
+    ordinal = str(int(prefix.group(1)))
+    return f"{scene}/sequence/{ordinal}" if scene else f"sequence/{ordinal}"
 
 
 def infer_modality(directory: Path, media_files: list[Path]) -> str | None:
@@ -210,6 +225,7 @@ class DatasetScanner:
 
         files: dict[str, list[Path]] = {name: [] for name in MODALITY_INFO}
         keyed: dict[str, dict[str, Path]] = {name: {} for name in MODALITY_INFO}
+        sequence_groups: dict[str, list[tuple[str, str, Path]]] = {}
         for modality, directories in modality_dirs.items():
             extensions = POINT_EXTENSIONS if modality == "ply" else IMAGE_EXTENSIONS
             for directory in directories:
@@ -225,7 +241,40 @@ class DatasetScanner:
                     if key in keyed[modality]:
                         key = f"{key}::{file.relative_to(root).as_posix().casefold()}"
                     keyed[modality][key] = file
+                    sequence_key = _sequence_alignment_key(key_path)
+                    if sequence_key is not None:
+                        sequence_groups.setdefault(sequence_key, []).append(
+                            (modality, key, file)
+                        )
             files[modality].sort(key=lambda p: natural_key(str(p.relative_to(root))))
+
+        # Some stereo recorders write an independent hardware timestamp for
+        # left and right images. When a unique leading capture ordinal exists,
+        # align those entries to the most widely shared primary key. Datasets
+        # whose timestamps already match keep their existing stable keys.
+        for entries in sequence_groups.values():
+            modalities = [modality for modality, _key, _file in entries]
+            if len(set(modalities)) < 2 or len(set(modalities)) != len(modalities):
+                continue
+            key_counts: dict[str, int] = {}
+            for _modality, key, _file in entries:
+                key_counts[key] = key_counts.get(key, 0) + 1
+            canonical = min(
+                key_counts,
+                key=lambda key: (-key_counts[key], natural_key(key)),
+            )
+            if any(
+                canonical in keyed[modality]
+                and keyed[modality][canonical] != file
+                for modality, _key, file in entries
+            ):
+                continue
+            for modality, old_key, file in entries:
+                if old_key == canonical:
+                    continue
+                if keyed[modality].get(old_key) == file:
+                    del keyed[modality][old_key]
+                keyed[modality][canonical] = file
 
         if force_order:
             sample_count = max((len(paths) for paths in files.values()), default=0)

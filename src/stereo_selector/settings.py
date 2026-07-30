@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QAbstractButton,
     QButtonGroup,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
@@ -121,6 +123,8 @@ class ShadowDialog(QDialog):
             widget.setProperty("embedded", True)
             widget.style().unpolish(widget)
             widget.style().polish(widget)
+            if widget.objectName() == "settingsHeader":
+                widget.hide()
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -141,6 +145,12 @@ class AppPreferences:
     theme: str = "dark"
     auto_advance: bool = True
     point_limit: int = 300_000
+    cloud_cam_offset: float = 0.05
+    cloud_grid: int = 5
+    cloud_dot_radius: float = 1.0
+    cloud_z_max: float = 10.0
+    cloud_tau_rel: float = 0.15
+    cloud_occlusion: bool = True
     button_labels: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_LABELS))
     shortcuts: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_SHORTCUTS))
 
@@ -167,10 +177,64 @@ class AppPreferences:
             theme = "dark"
         point_limit = settings.value("preferences/point_limit", 300_000, type=int)
         point_limit = max(50_000, min(1_000_000, point_limit))
+        cam_offset = settings.value(
+            "preferences/point_cloud/cam_offset",
+            0.05,
+            type=float,
+        )
+        defaults_version = settings.value(
+            "preferences/point_cloud/defaults_version",
+            0,
+            type=int,
+        )
+        grid = settings.value("preferences/point_cloud/grid", 5, type=int)
+        dot_radius = settings.value(
+            "preferences/point_cloud/dot_radius",
+            1.0,
+            type=float,
+        )
+        legacy_z_max = settings.value("preferences/point_max_distance", 10.0, type=float)
+        z_max = settings.value(
+            "preferences/point_cloud/ply_z_max",
+            legacy_z_max,
+            type=float,
+        )
+        tau_rel = settings.value(
+            "preferences/point_cloud/tau_rel",
+            0.15,
+            type=float,
+        )
+        if not math.isfinite(cam_offset):
+            cam_offset = 0.05
+        if not math.isfinite(dot_radius):
+            dot_radius = 1.0
+        if not math.isfinite(z_max):
+            z_max = 10.0
+        if not math.isfinite(tau_rel):
+            tau_rel = 0.15
+        if defaults_version < 2:
+            # Migrate the former defaults while preserving values that the
+            # user had already customized.
+            if grid == 6:
+                grid = 5
+            if dot_radius == 2.0:
+                dot_radius = 1.0
+            if z_max == 15.0:
+                z_max = 10.0
         return cls(
             theme=theme,
             auto_advance=settings.value("preferences/auto_advance", True, type=bool),
             point_limit=point_limit,
+            cloud_cam_offset=max(0.0, min(1.0, cam_offset)),
+            cloud_grid=max(1, min(32, grid)),
+            cloud_dot_radius=max(0.5, min(12.0, dot_radius)),
+            cloud_z_max=max(0.1, min(1_000.0, z_max)),
+            cloud_tau_rel=max(0.0, min(1.0, tau_rel)),
+            cloud_occlusion=settings.value(
+                "preferences/point_cloud/occlusion",
+                True,
+                type=bool,
+            ),
             button_labels=labels,
             shortcuts=shortcuts,
         )
@@ -179,6 +243,13 @@ class AppPreferences:
         settings.setValue("preferences/theme", self.theme)
         settings.setValue("preferences/auto_advance", self.auto_advance)
         settings.setValue("preferences/point_limit", self.point_limit)
+        settings.setValue("preferences/point_cloud/cam_offset", self.cloud_cam_offset)
+        settings.setValue("preferences/point_cloud/grid", self.cloud_grid)
+        settings.setValue("preferences/point_cloud/dot_radius", self.cloud_dot_radius)
+        settings.setValue("preferences/point_cloud/ply_z_max", self.cloud_z_max)
+        settings.setValue("preferences/point_cloud/tau_rel", self.cloud_tau_rel)
+        settings.setValue("preferences/point_cloud/occlusion", self.cloud_occlusion)
+        settings.setValue("preferences/point_cloud/defaults_version", 2)
         for key, value in self.button_labels.items():
             settings.setValue(f"preferences/buttons/{key}", value)
         for key, value in self.shortcuts.items():
@@ -359,8 +430,8 @@ class SettingRow(QFrame):
         self.setObjectName("settingRow")
         self.setMaximumWidth(960)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 11, 12, 11)
-        layout.setSpacing(18)
+        layout.setContentsMargins(2, 10, 2, 10)
+        layout.setSpacing(16)
         copy = QVBoxLayout()
         copy.setSpacing(2)
         heading = QLabel(title)
@@ -429,6 +500,12 @@ class SettingsDialog(ShadowDialog):
             theme=preferences.theme,
             auto_advance=preferences.auto_advance,
             point_limit=preferences.point_limit,
+            cloud_cam_offset=preferences.cloud_cam_offset,
+            cloud_grid=preferences.cloud_grid,
+            cloud_dot_radius=preferences.cloud_dot_radius,
+            cloud_z_max=preferences.cloud_z_max,
+            cloud_tau_rel=preferences.cloud_tau_rel,
+            cloud_occlusion=preferences.cloud_occlusion,
             button_labels=dict(preferences.button_labels),
             shortcuts=dict(preferences.shortcuts),
         )
@@ -442,7 +519,7 @@ class SettingsDialog(ShadowDialog):
         self.header = DialogHeader()
         self.header.setObjectName("settingsHeader")
         header_layout = QHBoxLayout(self.header)
-        header_layout.setContentsMargins(18, 0, 6, 0)
+        header_layout.setContentsMargins(14, 0, 5, 0)
         title = QLabel("设置")
         title.setObjectName("settingsTitle")
         self.close_button = DialogCloseButton()
@@ -457,7 +534,7 @@ class SettingsDialog(ShadowDialog):
         body.setSpacing(0)
         self.navigation = QListWidget()
         self.navigation.setObjectName("settingsNav")
-        self.navigation.setFixedWidth(184)
+        self.navigation.setFixedWidth(176)
         self.navigation.addItems(["外观", "交互", "标定", "按钮文字", "快捷键", "性能"])
         self.pages = QStackedWidget()
         self.pages.setObjectName("settingsPages")
@@ -476,7 +553,7 @@ class SettingsDialog(ShadowDialog):
         self.footer = QFrame()
         self.footer.setObjectName("settingsFooter")
         footer_layout = QHBoxLayout(self.footer)
-        footer_layout.setContentsMargins(14, 10, 14, 10)
+        footer_layout.setContentsMargins(12, 8, 12, 8)
         reset = QPushButton("恢复默认")
         reset.setObjectName("ghostButton")
         reset.clicked.connect(self._reset_defaults)
@@ -494,8 +571,8 @@ class SettingsDialog(ShadowDialog):
     def _page(self, title: str, description: str) -> tuple[QWidget, QVBoxLayout]:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(30, 26, 30, 26)
-        layout.setSpacing(10)
+        layout.setContentsMargins(24, 22, 24, 24)
+        layout.setSpacing(8)
         heading = QLabel(title)
         heading.setObjectName("settingsPageTitle")
         layout.addWidget(heading)
@@ -504,7 +581,7 @@ class SettingsDialog(ShadowDialog):
             subtitle.setObjectName("settingsDescription")
             subtitle.setWordWrap(True)
             layout.addWidget(subtitle)
-        layout.addSpacing(12)
+        layout.addSpacing(8)
         return page, layout
 
     def _appearance_page(self) -> QWidget:
@@ -649,6 +726,81 @@ class SettingsDialog(ShadowDialog):
         self.point_limit_spin.setSuffix(" 点")
         self.point_limit_spin.setMinimumWidth(160)
         layout.addWidget(SettingRow("点云显示上限", "较低数值可提升加载和交互速度。", self.point_limit_spin))
+        self.cloud_cam_offset_spin = QDoubleSpinBox()
+        self.cloud_cam_offset_spin.setRange(0.0, 1.0)
+        self.cloud_cam_offset_spin.setDecimals(2)
+        self.cloud_cam_offset_spin.setSingleStep(0.01)
+        self.cloud_cam_offset_spin.setValue(self.preferences.cloud_cam_offset)
+        self.cloud_cam_offset_spin.setSuffix(" m")
+        self.cloud_cam_offset_spin.setMinimumWidth(160)
+        layout.addWidget(
+            SettingRow(
+                "虚拟相机后移",
+                "cam_offset；增大可缩小画面并扩大初始视野。",
+                self.cloud_cam_offset_spin,
+            )
+        )
+        self.cloud_grid_spin = QSpinBox()
+        self.cloud_grid_spin.setRange(1, 32)
+        self.cloud_grid_spin.setValue(self.preferences.cloud_grid)
+        self.cloud_grid_spin.setSuffix(" px")
+        self.cloud_grid_spin.setMinimumWidth(160)
+        layout.addWidget(
+            SettingRow(
+                "采样网格",
+                "grid；数值越大点越稀疏，渲染越快。",
+                self.cloud_grid_spin,
+            )
+        )
+        self.cloud_dot_radius_spin = QDoubleSpinBox()
+        self.cloud_dot_radius_spin.setRange(0.5, 12.0)
+        self.cloud_dot_radius_spin.setDecimals(1)
+        self.cloud_dot_radius_spin.setSingleStep(0.5)
+        self.cloud_dot_radius_spin.setValue(self.preferences.cloud_dot_radius)
+        self.cloud_dot_radius_spin.setSuffix(" px")
+        self.cloud_dot_radius_spin.setMinimumWidth(160)
+        layout.addWidget(
+            SettingRow(
+                "点半径",
+                "dot_radius；仅改变圆点粗细，不改变几何缩放。",
+                self.cloud_dot_radius_spin,
+            )
+        )
+        self.cloud_z_max_spin = QDoubleSpinBox()
+        self.cloud_z_max_spin.setRange(0.1, 1_000.0)
+        self.cloud_z_max_spin.setDecimals(1)
+        self.cloud_z_max_spin.setSingleStep(1.0)
+        self.cloud_z_max_spin.setValue(self.preferences.cloud_z_max)
+        self.cloud_z_max_spin.setSuffix(" m")
+        self.cloud_z_max_spin.setMinimumWidth(160)
+        layout.addWidget(
+            SettingRow(
+                "最远显示距离",
+                "ply_z_max；只过滤可见距离，不控制缩放。",
+                self.cloud_z_max_spin,
+            )
+        )
+        self.cloud_tau_rel_spin = QDoubleSpinBox()
+        self.cloud_tau_rel_spin.setRange(0.0, 1.0)
+        self.cloud_tau_rel_spin.setDecimals(2)
+        self.cloud_tau_rel_spin.setSingleStep(0.01)
+        self.cloud_tau_rel_spin.setValue(self.preferences.cloud_tau_rel)
+        self.cloud_tau_rel_spin.setMinimumWidth(160)
+        layout.addWidget(
+            SettingRow(
+                "飞点过滤强度",
+                "tau_rel；增大时过滤更严格，可能删除更多边缘点。",
+                self.cloud_tau_rel_spin,
+            )
+        )
+        self.cloud_occlusion_check = ToggleSwitch(self.preferences.cloud_occlusion)
+        layout.addWidget(
+            SettingRow(
+                "近点遮挡远点",
+                "同一投影网格只保留最近点，并按从远到近绘制。",
+                self.cloud_occlusion_check,
+            )
+        )
         layout.addStretch(1)
         return page
 
@@ -656,6 +808,12 @@ class SettingsDialog(ShadowDialog):
         self.theme_combo.setCurrentIndex(0)
         self.auto_advance_check.setChecked(True)
         self.point_limit_spin.setValue(300_000)
+        self.cloud_cam_offset_spin.setValue(0.05)
+        self.cloud_grid_spin.setValue(5)
+        self.cloud_dot_radius_spin.setValue(1.0)
+        self.cloud_z_max_spin.setValue(10.0)
+        self.cloud_tau_rel_spin.setValue(0.15)
+        self.cloud_occlusion_check.setChecked(True)
         if self.project_available:
             self.calibration_combo.setCurrentIndex(0)
         for key, edit in self.label_edits.items():
@@ -690,6 +848,12 @@ class SettingsDialog(ShadowDialog):
         self.preferences.theme = self.theme_combo.currentData()
         self.preferences.auto_advance = self.auto_advance_check.isChecked()
         self.preferences.point_limit = self.point_limit_spin.value()
+        self.preferences.cloud_cam_offset = self.cloud_cam_offset_spin.value()
+        self.preferences.cloud_grid = self.cloud_grid_spin.value()
+        self.preferences.cloud_dot_radius = self.cloud_dot_radius_spin.value()
+        self.preferences.cloud_z_max = self.cloud_z_max_spin.value()
+        self.preferences.cloud_tau_rel = self.cloud_tau_rel_spin.value()
+        self.preferences.cloud_occlusion = self.cloud_occlusion_check.isChecked()
         self.preferences.button_labels = labels
         self.preferences.shortcuts = sequences
         self.selected_calibration_id = (
