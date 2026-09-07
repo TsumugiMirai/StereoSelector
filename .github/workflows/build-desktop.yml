@@ -163,6 +163,20 @@ jobs:
           test -f "$package_path"
           echo "PACKAGE_PATH=$package_path" >> "$GITHUB_ENV"
 
+      - name: Smoke test Windows package
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          python scripts/create_smoke_dataset.py build/smoke-data
+          $process = Start-Process -FilePath "dist/$env:APP_NAME.exe" -ArgumentList '--smoke-test', 'build/smoke-data' -WindowStyle Hidden -PassThru
+          if (-not $process.WaitForExit(60000)) {
+            Stop-Process -Id $process.Id -Force
+            throw 'Packaged application startup timed out.'
+          }
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged application smoke test failed: $($process.ExitCode)"
+          }
+
       - name: Prepare macOS package
         if: matrix.platform == 'macos'
         shell: bash

@@ -14,6 +14,16 @@ RELEASE_VERSION = release_version(PROJECT_VERSION)
 APP_NAME = f"StereoSelector-v{RELEASE_VERSION}"
 IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
+if IS_WINDOWS:
+    # Keep unrelated command-line toolchains out of DLL dependency discovery.
+    # In particular, Poppler's icuuc.dll is not Windows' ICU implementation.
+    windows_root = Path(os.environ.get("SystemRoot", "C:/Windows"))
+    os.environ["PATH"] = os.pathsep.join(
+        str(path) for path in (
+            Path(sys.prefix), Path(sys.prefix) / "Scripts", Path(sys.base_prefix),
+            windows_root / "System32", windows_root,
+        )
+    )
 DEFAULT_ICON = PROJECT_ROOT / "src" / "stereo_selector" / "assets" / "app_icon.png"
 ICON_PATH = os.environ.get("STEREO_SELECTOR_ICON", str(DEFAULT_ICON))
 BUILD_DIR = PROJECT_ROOT / "build"
@@ -92,6 +102,31 @@ a = Analysis(
     optimize=1,
 )
 pyz = PYZ(a.pure)
+
+# The bootloader loads the root VC runtime before Qt. Older Python installs
+# can otherwise shadow Qt's newer runtime and make QtCore fail to import.
+if IS_WINDOWS:
+    import pefile
+
+    # Windows 10+ provides UCRT and API sets. Never bundle old compatibility
+    # copies found on PATH (for example in an unrelated image toolkit).
+    a.binaries = [
+        entry for entry in a.binaries
+        if Path(entry[0]).name.lower() != "ucrtbase.dll"
+        and not Path(entry[0]).name.lower().startswith(("api-ms-win-", "ext-ms-win-"))
+    ]
+    for runtime in ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll"):
+        candidates = []
+        for destination, source, _kind in a.binaries:
+            if Path(destination).name.lower() == runtime:
+                with pefile.PE(source, fast_load=True) as pe:
+                    pe.parse_data_directories(directories=[2])
+                    info = pe.VS_FIXEDFILEINFO[0]
+                    candidates.append(((info.FileVersionMS, info.FileVersionLS), source))
+        if candidates:
+            source = max(candidates)[1]
+            a.binaries = [entry for entry in a.binaries if Path(entry[0]).name.lower() != runtime]
+            a.binaries.append((runtime, source, "BINARY"))
 
 exe_options = {
     "name": APP_NAME,

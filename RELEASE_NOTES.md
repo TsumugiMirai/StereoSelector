@@ -30,6 +30,7 @@
 
 - 内置标定 JSON 随包分发（`stereo_selector/assets/calibration`），`pip install` 后仍可用。
 - 版本号只在 `pyproject.toml` 维护；Windows 版本资源由打包脚本生成。
+- Windows 打包刷新版本元数据，隔离外部工具的旧系统运行库，并在 CI 中验证 EXE 启动及数据加载。
 - 新增 `ruff` 与 pre-commit 配置，CI 运行静态检查。
 - 应用日志写入用户数据目录（Windows：`%LOCALAPPDATA%\ToolBox\StereoSelector\logs`），可用 `--verbose` 打开调试级别。
 - 新增 `scripts/validate_datasets.py`，对真实采集数据做离屏功能验证（加载、标定、校正、读数、点云、导出）。

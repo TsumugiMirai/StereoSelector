@@ -8,6 +8,11 @@ if (-not (Test-Path -LiteralPath $PythonExe)) {
 
 Push-Location $ProjectRoot
 try {
+    # Refresh distribution metadata, which is embedded in the frozen app.
+    & $PythonExe -m pip install --no-deps -e .
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to refresh the project metadata."
+    }
     # The output name is derived from pyproject.toml by StereoSelector.spec;
     # ask the package for the same value so this script never drifts.
     $AppName = & $PythonExe -c "import sys; sys.path.insert(0, 'src'); from stereo_selector import release_version; print(f'StereoSelector-v{release_version()}')"
