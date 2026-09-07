@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import re
-import shutil
 import os
+import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
-
 
 MODALITY_INFO: dict[str, tuple[str, tuple[str, ...]]] = {
     "left": ("左目 RGB", ("left", "left_rgb", "rgb_left")),
@@ -43,6 +41,21 @@ _MODALITY_HINTS = {
     "depth_fsd": ("depth", "distance", "range", "z16", "disparity", "深度", "视差"),
     "ply": ("ply", "pointcloud", "point_cloud", "cloud", "点云"),
 }
+
+_IGNORED_PROJECT_FOLDERS = {
+    ".git",
+    ".idea",
+    ".vscode",
+    "__pycache__",
+}
+
+
+def _modality_aliases() -> dict[str, str]:
+    return {
+        alias.casefold(): modality
+        for modality, (_, aliases) in MODALITY_INFO.items()
+        for alias in aliases
+    }
 
 
 def natural_key(value: str) -> tuple[object, ...]:
@@ -118,6 +131,69 @@ def infer_modality(directory: Path, media_files: list[Path]) -> str | None:
     return None
 
 
+def detected_modalities(root: Path, *, max_depth: int = 3) -> set[str]:
+    """Quickly identify the view types contained by a possible project root.
+
+    Only representative files are inspected.  This keeps collection discovery
+    fast even when every project contains thousands of frames.
+    """
+    root = root.expanduser().resolve()
+    if not root.is_dir():
+        return set()
+    aliases = _modality_aliases()
+    detected: set[str] = set()
+    for current, directory_names, file_names in os.walk(root):
+        current_path = Path(current)
+        depth = len(current_path.relative_to(root).parts)
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if name not in _IGNORED_PROJECT_FOLDERS
+            and not name.casefold().endswith("_select")
+        ]
+        if depth >= max_depth:
+            directory_names[:] = []
+        media_files = [
+            current_path / name
+            for name in sorted(file_names, key=natural_key)
+            if Path(name).suffix.casefold() in IMAGE_EXTENSIONS | POINT_EXTENSIONS
+        ][:8]
+        if not media_files:
+            continue
+        modality = aliases.get(current_path.name.casefold()) or infer_modality(
+            current_path, media_files
+        )
+        if modality is not None:
+            detected.add(modality)
+            directory_names[:] = []
+    return detected
+
+
+def discover_project_roots(root: Path) -> list[Path]:
+    """Return independently switchable projects below *root*.
+
+    A folder whose immediate children each contain at least two recognizable
+    views is treated as a project collection.  Otherwise the selected folder
+    remains one project and its nested view folders are scanned recursively.
+    """
+    root = root.expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"项目文件夹不存在：{root}")
+    candidates: list[Path] = []
+    for child in sorted(
+        (path for path in root.iterdir() if path.is_dir()),
+        key=lambda path: natural_key(path.name),
+    ):
+        if (
+            child.name in _IGNORED_PROJECT_FOLDERS
+            or child.name.casefold().endswith("_select")
+        ):
+            continue
+        if len(detected_modalities(child)) >= 2:
+            candidates.append(child.resolve())
+    return candidates if len(candidates) >= 2 else [root]
+
+
 @dataclass(frozen=True)
 class Sample:
     key: str
@@ -135,15 +211,11 @@ class Dataset:
     files: dict[str, list[Path]] = field(default_factory=dict)
     samples: list[Sample] = field(default_factory=list)
     force_order: bool = False
-    custom_output_root: Path | None = None
 
     @property
     def available_modalities(self) -> list[str]:
         return [name for name in MODALITY_INFO if self.files.get(name)]
 
-    @property
-    def output_root(self) -> Path:
-        return self.custom_output_root or (self.root.parent / f"{self.root.name}_select")
 
 
 class DatasetScanner:
@@ -152,22 +224,18 @@ class DatasetScanner:
         root: Path,
         manual_dirs: dict[str, Path] | None = None,
         force_order: bool = False,
-        output_root: Path | None = None,
+        progress: Callable[[str, int, int], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> Dataset:
+        def abort_if_cancelled() -> None:
+            if cancel_check is not None and cancel_check():
+                raise InterruptedError("项目扫描已取消")
+
         root = root.expanduser().resolve()
         if not root.is_dir():
             raise ValueError(f"项目文件夹不存在：{root}")
-        resolved_output = output_root.expanduser().resolve() if output_root is not None else None
-        if resolved_output is not None and (
-            resolved_output == root or resolved_output.is_relative_to(root)
-        ):
-            raise ValueError("输出文件夹不能位于项目文件夹内部")
-
-        alias_to_modality = {
-            alias.casefold(): modality
-            for modality, (_, aliases) in MODALITY_INFO.items()
-            for alias in aliases
-        }
+        abort_if_cancelled()
+        alias_to_modality = _modality_aliases()
         modality_dirs: dict[str, list[Path]] = {name: [] for name in MODALITY_INFO}
 
         resolved_manual: dict[str, Path] = {}
@@ -186,11 +254,15 @@ class DatasetScanner:
         # from their file extensions, name hints and representative image type.
         manual_paths = set(resolved_manual.values())
         unknown_image_dirs: list[Path] = []
+        discovered_files = 0
         for current, directory_names, file_names in os.walk(root):
+            abort_if_cancelled()
             current_path = Path(current)
             directory_names.sort(key=natural_key)
             descend: list[str] = []
             for name in directory_names:
+                if name in _IGNORED_PROJECT_FOLDERS or name.casefold().endswith("_select"):
+                    continue
                 directory = current_path / name
                 if manual_paths and directory.resolve() in manual_paths:
                     continue
@@ -205,6 +277,9 @@ class DatasetScanner:
                 for name in sorted(file_names, key=natural_key)
                 if Path(name).suffix.casefold() in IMAGE_EXTENSIONS | POINT_EXTENSIONS
             ]
+            discovered_files += len(direct_media)
+            if progress is not None:
+                progress("正在扫描目录…", discovered_files, 0)
             if direct_media and current_path != root and current_path not in manual_paths:
                 inferred = infer_modality(current_path, direct_media)
                 if inferred is not None and inferred not in resolved_manual:
@@ -216,7 +291,7 @@ class DatasetScanner:
         # When names contain no hints at all, a pair of RGB folders is still a
         # useful stereo candidate. Natural ordering provides a deterministic fallback.
         missing_rgb = [name for name in ("left", "right") if not modality_dirs[name]]
-        if unknown_image_dirs and len(unknown_image_dirs) <= len(missing_rgb):
+        if unknown_image_dirs:
             for modality, directory in zip(missing_rgb, sorted(unknown_image_dirs, key=lambda p: natural_key(str(p)))):
                 modality_dirs[modality].append(directory)
 
@@ -226,12 +301,19 @@ class DatasetScanner:
         files: dict[str, list[Path]] = {name: [] for name in MODALITY_INFO}
         keyed: dict[str, dict[str, Path]] = {name: {} for name in MODALITY_INFO}
         sequence_groups: dict[str, list[tuple[str, str, Path]]] = {}
+        indexed_files = 0
         for modality, directories in modality_dirs.items():
             extensions = POINT_EXTENSIONS if modality == "ply" else IMAGE_EXTENSIONS
             for directory in directories:
+                abort_if_cancelled()
                 for file in directory.rglob("*"):
                     if not file.is_file() or file.suffix.casefold() not in extensions:
                         continue
+                    indexed_files += 1
+                    if indexed_files % 500 == 0:
+                        if progress is not None:
+                            progress("正在索引文件…", indexed_files, 0)
+                        abort_if_cancelled()
                     files[modality].append(file)
                     relative_inside = file.relative_to(directory)
                     # Prefix mirrored scene location when several modality folders exist.
@@ -247,6 +329,9 @@ class DatasetScanner:
                             (modality, key, file)
                         )
             files[modality].sort(key=lambda p: natural_key(str(p.relative_to(root))))
+        abort_if_cancelled()
+        if progress is not None:
+            progress("正在匹配样本…", 0, 0)
 
         # Some stereo recorders write an independent hardware timestamp for
         # left and right images. When a unique leading capture ordinal exists,
@@ -297,40 +382,7 @@ class DatasetScanner:
             files={name: paths for name, paths in files.items() if paths},
             samples=samples,
             force_order=force_order,
-            custom_output_root=resolved_output,
         )
-
-
-def copy_sample(dataset: Dataset, sample: Sample) -> list[Path]:
-    """Copy every matched asset atomically while preserving the source structure."""
-    copied: list[Path] = []
-    for source in sample.files.values():
-        relative = source.relative_to(dataset.root)
-        destination = dataset.output_root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(f".{destination.name}.stereoselector-copying")
-        try:
-            shutil.copy2(source, temporary)
-            os.replace(temporary, destination)
-        except Exception:
-            temporary.unlink(missing_ok=True)
-            raise
-        copied.append(destination)
-    return copied
-
-
-def sample_is_copied(dataset: Dataset, sample: Sample) -> bool:
-    """Return true only when every final output exists with the complete source size."""
-    if not sample.files:
-        return False
-    try:
-        return all(
-            (destination := dataset.output_root / source.relative_to(dataset.root)).is_file()
-            and destination.stat().st_size == source.stat().st_size
-            for source in sample.files.values()
-        )
-    except OSError:
-        return False
 
 
 def modality_label(modality: str) -> str:

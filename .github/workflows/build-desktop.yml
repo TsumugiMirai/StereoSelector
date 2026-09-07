@@ -78,6 +78,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[test]"
 
+      - name: Lint
+        run: python -m ruff check src scripts tests
+
       - name: Run tests
         env:
           QT_QPA_PLATFORM: offscreen
@@ -331,8 +334,8 @@ jobs:
           set -euo pipefail
           "$PYTHON_BIN" -m PyInstaller.utils.cliutils.archive_viewer \
             -l "dist/${APP_NAME}" > build/pyinstaller-archive.txt
-          grep -F "calib2000_004_b" build/pyinstaller-archive.txt
-          grep -F "calib3000_003" build/pyinstaller-archive.txt
+          grep -F "assets/calibration/calib2000_004_b" build/pyinstaller-archive.txt
+          grep -F "assets/calibration/calib3000_003" build/pyinstaller-archive.txt
 
       - name: Prepare Linux AppImage
         run: |

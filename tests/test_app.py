@@ -10,17 +10,25 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PySide6.QtWidgets import QApplication, QMessageBox
-from PySide6.QtCore import Qt
-from PySide6.QtCore import QSettings, QThreadPool
+from PySide6.QtCore import QPoint, QRunnable, QSettings, Qt, QTimer
 from PySide6.QtTest import QTest
+from PySide6.QtWidgets import (
+    QApplication,
+    QMessageBox,
+    QProgressDialog,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
-from stereo_selector.app import MainWindow
 from stereo_selector import app as app_module
+from stereo_selector import workers
+from stereo_selector.app import MainWindow
 from stereo_selector.bootstrap import application_icon, asset_path
 from stereo_selector.calibration import builtin_calibration_options
 from stereo_selector.mapping import MappingDialog
 from stereo_selector.settings import (
+    DEFAULT_SHORTCUTS,
     AppPreferences,
     ChoiceButton,
     SegmentedControl,
@@ -29,6 +37,7 @@ from stereo_selector.settings import (
     reserved_shortcut_actions,
 )
 from stereo_selector.theme import PALETTES, style_for
+from stereo_selector.workers import ProjectScanSignals, RectifySignals
 
 
 def _make_project(root: Path) -> Path:
@@ -38,6 +47,106 @@ def _make_project(root: Path) -> Path:
             path.parent.mkdir(parents=True, exist_ok=True)
             Image.new("RGB", (32, 24), color).save(path)
     return root
+
+
+def test_cancel_project_scan_returns_without_missing_result_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+
+    class WaitingScanWorker(QRunnable):
+        instance = None
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
+            self.signals = ProjectScanSignals()
+            self.cancelled = False
+            WaitingScanWorker.instance = self
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    class HoldingPool:
+        def start(self, _worker) -> None:
+            return
+
+    monkeypatch.setattr(app_module, "ProjectScanWorker", WaitingScanWorker)
+    monkeypatch.setattr(app_module, "SCAN_POOL", HoldingPool())
+    window = MainWindow()
+
+    def click_cancel() -> None:
+        dialogs = [
+            widget
+            for widget in QApplication.topLevelWidgets()
+            if isinstance(widget, QProgressDialog)
+        ]
+        assert dialogs
+        button = dialogs[0].findChild(QPushButton)
+        assert button is not None
+        button.click()
+
+    QTimer.singleShot(20, click_cancel)
+    window.load_project(tmp_path)
+
+    assert WaitingScanWorker.instance is not None
+    assert WaitingScanWorker.instance.cancelled
+    assert window.dataset is None
+    assert window.current_root is None
+    window.close()
+
+
+def test_stale_rectification_failure_cannot_cancel_new_request(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_project(_make_project(tmp_path / "capture"))
+    workers.wait_for_all(5000)
+    app.processEvents()
+    assert window._apply_calibration_selection("builtin:libra3000")
+    workers.wait_for_all(5000)
+    app.processEvents()
+
+    class PendingRectifyWorker:
+        def __init__(self, token, *_args) -> None:
+            self.token = token
+            self.signals = RectifySignals()
+
+    class HoldingPool:
+        def __init__(self) -> None:
+            self.workers = []
+
+        def start(self, worker) -> None:
+            self.workers.append(worker)
+
+    pool = HoldingPool()
+    monkeypatch.setattr(app_module, "RectifyWorker", PendingRectifyWorker)
+    monkeypatch.setattr(app_module, "IMAGE_POOL", pool)
+
+    window.rectify_button.blockSignals(True)
+    window.rectify_button.setChecked(True)
+    window.rectify_button.blockSignals(False)
+    window._apply_rectified_views()
+    first = pool.workers[-1]
+
+    window.rectify_button.setChecked(False)
+    window.rectify_button.blockSignals(True)
+    window.rectify_button.setChecked(True)
+    window.rectify_button.blockSignals(False)
+    window._apply_rectified_views()
+    second = pool.workers[-1]
+    assert second.token > first.token
+
+    first.signals.failed.emit(first.token, "stale failure")
+    app.processEvents()
+
+    assert window.rectify_button.isChecked()
+    assert window._rectify_token == second.token
+    assert window._rectify_worker is second
+    window.rectify_button.setChecked(False)
+    window.close()
 
 
 def test_empty_startup_stays_idle_without_open_dialog(monkeypatch) -> None:
@@ -58,14 +167,14 @@ def test_empty_startup_stays_idle_without_open_dialog(monkeypatch) -> None:
     assert window.title_bar.context.isHidden()
     assert window.project_path_label.isHidden()
     assert window.project_summary_label.isHidden()
-    assert window.change_button.isHidden()
-    assert window.manual_mapping_button.isHidden()
+    assert not window.change_button.isHidden()
+    assert not window.manual_mapping_button.isEnabled()
     assert window.modes_panel.isHidden()
     assert window.quality_panel.isHidden()
     assert not hasattr(window, "review_panel")
-    assert window.output_panel.isHidden()
+    assert not hasattr(window, "output_panel")
     assert window.reset_button.isHidden()
-    assert window.review_bar.isHidden()
+    assert window.player_bar.isHidden()
     assert window.inspection_bar.isHidden()
     assert not hasattr(window, "shortcut_hint")
     window.close()
@@ -110,12 +219,16 @@ def test_primary_actions_share_the_integrated_title_bar() -> None:
     app.processEvents()
 
     assert window.title_bar.height() == 40
-    assert window.workspace_header.isHidden()
-    assert window.workspace_header.height() == 0
-    assert window.mode_picker.parentWidget() is window.title_bar.actions
+    assert not hasattr(window, "mode_picker")
     assert window.open_button.parentWidget() is window.title_bar.actions
     assert window.layout_picker.parentWidget() is window.title_bar.actions
     assert window.header_settings_button.parentWidget() is window.title_bar.actions
+    assert window.topbar_button.parentWidget() is window.title_bar.actions
+    assert not window.topbar_button.isEnabled()
+    assert window.sidebar_button.parentWidget() is window.inspection_tools_row
+    assert window.inspection_tools_row.parentWidget() is window.inspection_bar
+    assert window.reset_button.parentWidget() is window.inspection_tools_row
+    assert window.view_hint.parentWidget() is window.inspection_tools_row
     assert window.media_grid.contentsMargins().left() == 8
     assert window.media_grid.spacing() == 8
 
@@ -132,7 +245,7 @@ def test_primary_actions_share_the_integrated_title_bar() -> None:
     window.close()
 
 
-def test_review_focus_and_accept_flow(tmp_path: Path) -> None:
+def test_viewer_focus_and_navigation_flow(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     project = _make_project(tmp_path / "capture")
     window = MainWindow(project)
@@ -144,16 +257,13 @@ def test_review_focus_and_accept_flow(tmp_path: Path) -> None:
     assert not window.project_path_label.isHidden()
     assert not window.project_summary_label.isHidden()
     assert window.change_button.text() == "更改项目"
-    assert not window.review_bar.isHidden()
+    assert not window.player_bar.isHidden()
     assert "按文件名匹配" not in window.project_summary_label.text()
     assert "滚轮缩放" not in window.view_hint.text()
-    assert window.previous_button.text() == window.preferences.button_labels["previous"]
-    assert window.next_button.text() == window.preferences.button_labels["next"]
-    assert window.accept_button.text() == window.preferences.button_labels["accept"]
-    assert window._shortcut_text("previous") in window.previous_button.toolTip()
-    assert window._shortcut_text("accept") in window.accept_button.toolTip()
-    assert window.product_mode == "view"
-    assert window.review_controls.isHidden()
+    assert window._shortcut_text("previous") in window.playback_previous_button.toolTip()
+    assert window._shortcut_text("next") in window.playback_next_button.toolTip()
+    assert not hasattr(window, "product_mode")
+    assert not hasattr(window, "review_controls")
 
     window.focus_modality("left")
     assert window.focused_modality == "left"
@@ -162,58 +272,10 @@ def test_review_focus_and_accept_flow(tmp_path: Path) -> None:
     window.exit_focus()
     assert all(not tile.isHidden() for tile in window.tiles.values())
 
-    first = window.dataset.samples[0]
-    window.set_product_mode("review")
-    window.accept_current()
-    assert first.key in window.accepted
-    assert window.current_index == 1
-    assert (project.parent / "capture_select" / "left" / "frame_0001.png").exists()
-    assert not hasattr(window, "accepted_count_label")
-    review_document = json.loads(
-        (project.parent / "capture_select" / "stereo_selector_review.json").read_text(encoding="utf-8")
-    )
-    assert review_document["samples"][first.key]["status"] == "accepted"
-    window.close()
-
-
-def test_existing_output_is_restored_as_accepted(tmp_path: Path) -> None:
-    app = QApplication.instance() or QApplication([])
-    project = _make_project(tmp_path / "capture")
-    window = MainWindow(project)
-    app.processEvents()
-    window.set_product_mode("review")
-    window.accept_current()
-    window.close()
-
-    reopened = MainWindow(project)
-    app.processEvents()
-    assert len(reopened.accepted) == 1
-    reopened.next_unreviewed()
-    assert reopened.current_index == 1
-    reopened.close()
-
-
-def test_accepted_sample_changes_the_entire_review_bar_state(tmp_path: Path) -> None:
-    app = QApplication.instance() or QApplication([])
-    project = _make_project(tmp_path / "capture")
-    window = MainWindow(project)
-    window.preferences.auto_advance = False
-    app.processEvents()
-    window.set_product_mode("review")
-
-    assert window.review_bar.property("reviewState") == "pending"
-    assert not window.sample_status.property("accepted")
-    window.accept_current()
-    app.processEvents()
-
-    assert window.review_bar.property("reviewState") == "accepted"
-    assert window.sample_status.property("accepted")
-    assert window.sample_status.text() == "已接受"
-    assert window.accept_button.text() == "继续"
-
     window.next_sample()
-    assert window.review_bar.property("reviewState") == "pending"
-    assert window.sample_status.text() == "待定"
+    assert window.current_index == 1
+    window.previous_sample()
+    assert window.current_index == 0
     window.close()
 
 
@@ -293,8 +355,8 @@ def test_view_toggle_reuses_point_cloud_widget(tmp_path: Path) -> None:
 
     window.checkboxes["ply"].setChecked(True)
     window.checkboxes["ply"].setChecked(False)
-    assert not pooled._workers
-    assert not pooled._loading_delay.isActive()
+    assert not pooled.has_pending_work()
+    assert not pooled.loading_delay_active()
     window.checkboxes["ply"].setChecked(True)
     app.processEvents()
     assert window.tiles["ply"] is pooled
@@ -311,20 +373,20 @@ def test_media_loading_is_asynchronous(tmp_path: Path) -> None:
     first_path = window.dataset.samples[0].files["left"]
     second_path = window.dataset.samples[1].files["left"]
 
-    QThreadPool.globalInstance().waitForDone(5000)
+    workers.wait_for_all(5000)
     app.processEvents()
     assert tile.stack.currentWidget() is tile.image_canvas
 
     tile.show_file(second_path)
     assert tile.stack.currentWidget() is tile.image_canvas
     assert not tile.spinner._timer.isActive()
-    assert tile._loading_delay.isActive()
-    QThreadPool.globalInstance().waitForDone(5000)
+    assert tile.loading_delay_active()
+    workers.wait_for_all(5000)
     app.processEvents()
     assert tile.stack.currentWidget() is tile.image_canvas
 
     tile.show_file(first_path)
-    assert not tile._workers
+    assert not tile.has_pending_work()
     assert tile.stack.currentWidget() is tile.image_canvas
     window.close()
 
@@ -333,7 +395,6 @@ def test_preferences_round_trip(tmp_path: Path) -> None:
     settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     preferences = AppPreferences(
         theme="light",
-        auto_advance=False,
         point_limit=150_000,
         cloud_cam_offset=0.1,
         cloud_grid=4,
@@ -341,8 +402,13 @@ def test_preferences_round_trip(tmp_path: Path) -> None:
         cloud_z_max=24.5,
         cloud_tau_rel=0.2,
         cloud_occlusion=False,
-        button_labels={"previous": "向前", "next": "向后", "accept": "保留"},
-        shortcuts={"previous": "A", "next": "D", "accept": "Space", "focus": "F", "reset": "R"},
+        shortcuts={
+            "previous": "A",
+            "next": "D",
+            "playback": "B",
+            "focus": "F",
+            "reset": "R",
+        },
     )
     preferences.save(settings)
     loaded = AppPreferences.load(settings)
@@ -369,14 +435,8 @@ def test_invalid_persisted_preferences_are_sanitized(tmp_path: Path) -> None:
     assert loaded.cloud_dot_radius == 1.0
     assert loaded.cloud_z_max == 10.0
     assert loaded.cloud_tau_rel == 0.15
-    assert loaded.button_labels["accept"] == "接受"
-    assert loaded.shortcuts == {
-        "previous": "Left",
-        "next": "Right",
-        "accept": "Return",
-        "focus": "F",
-        "reset": "R",
-    }
+    assert not hasattr(loaded, "button_labels")
+    assert loaded.shortcuts == DEFAULT_SHORTCUTS
 
 
 def test_former_point_cloud_defaults_are_migrated_once(tmp_path: Path) -> None:
@@ -402,37 +462,26 @@ def test_former_point_cloud_defaults_are_migrated_once(tmp_path: Path) -> None:
     assert customized.cloud_z_max == 15.0
 
 
-def test_legacy_default_button_labels_are_simplified(tmp_path: Path) -> None:
-    settings = QSettings(str(tmp_path / "legacy.ini"), QSettings.Format.IniFormat)
-    settings.setValue("preferences/buttons/previous", "←  上一组")
-    settings.setValue("preferences/buttons/next", "跳过 / 下一组  →")
-    settings.setValue("preferences/buttons/accept", "接受并继续")
-
-    loaded = AppPreferences.load(settings)
-
-    assert loaded.button_labels == {"previous": "上一组", "next": "下一组", "accept": "接受"}
-
-
 def test_settings_use_consistent_selection_controls() -> None:
     app = QApplication.instance() or QApplication([])
     options = builtin_calibration_options()
     dialog = SettingsDialog(
-        AppPreferences(theme="light", auto_advance=False),
+        AppPreferences(theme="light"),
         calibration_options=options,
         project_available=True,
     )
     assert isinstance(dialog.theme_combo, SegmentedControl)
     assert dialog.theme_combo.currentData() == "light"
-    assert isinstance(dialog.auto_advance_check, ToggleSwitch)
+    assert isinstance(dialog.cloud_occlusion_check, ToggleSwitch)
     assert isinstance(dialog.calibration_combo, ChoiceButton)
-    assert not dialog.auto_advance_check.isChecked()
+    assert not hasattr(dialog, "auto_advance_check")
     assert dialog.cloud_cam_offset_spin.value() == 0.05
     assert dialog.cloud_grid_spin.value() == 5
     assert dialog.cloud_dot_radius_spin.value() == 1.0
     assert dialog.cloud_z_max_spin.value() == 10.0
     assert dialog.cloud_tau_rel_spin.value() == 0.15
     assert dialog.cloud_occlusion_check.isChecked()
-    assert dialog.navigation.count() == 6
+    assert dialog.navigation.count() == 4
     assert dialog.calibration_combo.count() == 3
     assert dialog.calibration_combo.itemText(1).startswith("libra2000")
     assert dialog.calibration_combo.itemText(2).startswith("libra3000")
@@ -474,16 +523,59 @@ def test_settings_open_as_an_integrated_main_window_page() -> None:
 
 def test_choice_button_uses_theme_owned_popup() -> None:
     app = QApplication.instance() or QApplication([])
-    selector = ChoiceButton()
+    host = QWidget()
+    host.resize(360, 240)
+    layout = QVBoxLayout(host)
+    selector = ChoiceButton(host)
+    layout.addWidget(selector)
     selector.addItem("无标定", "")
     selector.addItem("libra2000", "builtin:libra2000")
 
-    assert selector._menu.objectName() == "choiceMenu"
     assert selector.findData("builtin:libra2000") == 1
-    selector.setCurrentIndex(1)
+    host.show()
+    selector.showPopup()
+    app.processEvents()
+    assert selector._popup is not None
+    assert selector._popup.objectName() == "choicePopup"
+    assert selector._popup.surface.objectName() == "choicePopupSurface"
+    assert selector._popup.parentWidget() is host
+    assert not selector._popup.isWindow()
+    assert selector._popup.isVisible()
+    assert len(selector._popup.option_buttons) == 2
+    QTest.mouseClick(selector._popup.option_buttons[1], Qt.MouseButton.LeftButton)
     assert selector.currentData() == "builtin:libra2000"
     assert selector.currentText() == "libra2000"
-    selector.close()
+    assert not selector._popup.isVisible()
+    selector.showPopup()
+    host.resize(420, 280)
+    app.processEvents()
+    assert not selector._popup.isVisible()
+    host.close()
+
+
+def test_main_choice_controls_share_non_native_popup(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(_make_project(tmp_path / "capture"))
+    window.resize(1200, 760)
+    window.show()
+    workers.wait_for_all(5000)
+    app.processEvents()
+
+    for selector in (
+        window.layout_picker,
+        window.calibration_picker,
+        window.playback_speed,
+    ):
+        assert isinstance(selector, ChoiceButton)
+        selector.showPopup()
+        app.processEvents()
+        assert selector._popup is not None
+        assert selector._popup.parentWidget() is window
+        assert not selector._popup.isWindow()
+        assert window.rect().contains(selector._popup.geometry())
+        selector.hidePopup()
+
+    window.close()
 
 
 def test_configurable_shortcuts_cannot_shadow_fixed_actions() -> None:
@@ -525,77 +617,6 @@ def test_manual_mapping_preferences_are_kept_per_project(tmp_path: Path) -> None
     window.close()
 
 
-def test_custom_output_is_saved_per_project_and_restored(tmp_path: Path) -> None:
-    app = QApplication.instance() or QApplication([])
-    project = _make_project(tmp_path / "capture")
-    custom_output = tmp_path / "exports" / "manual_review"
-    window = MainWindow()
-    window.settings = QSettings(str(tmp_path / "output.ini"), QSettings.Format.IniFormat)
-    window._save_output_for(project.resolve(), custom_output.resolve())
-
-    window.load_project(project)
-
-    assert window.dataset is not None
-    assert window.dataset.output_root == custom_output.resolve()
-    assert window.output_label.text() == str(custom_output.resolve())
-    assert not (custom_output / "stereo_selector_review.json").exists()
-    window.set_product_mode("review")
-    assert (custom_output / "stereo_selector_review.json").is_file()
-    window.accept_current()
-    assert (custom_output / "left" / "frame_0001.png").is_file()
-    window.close()
-
-
-def test_configure_output_updates_active_project_without_moving_old_files(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    app = QApplication.instance() or QApplication([])
-    project = _make_project(tmp_path / "capture")
-    selected_output = (tmp_path / "chosen" / "named_output").resolve()
-    window = MainWindow(project)
-    app.processEvents()
-    window.set_product_mode("review")
-    window.settings = QSettings(str(tmp_path / "output.ini"), QSettings.Format.IniFormat)
-    old_output = window.dataset.output_root
-
-    class AcceptedOutputDialog:
-        def __init__(self, *args, **kwargs) -> None:
-            self.output_root = selected_output
-
-        def exec(self) -> int:
-            return 1
-
-    monkeypatch.setattr(app_module, "OutputSettingsDialog", AcceptedOutputDialog)
-    window.configure_output()
-
-    assert window.dataset is not None
-    assert window.dataset.output_root == selected_output
-    assert window._saved_output_for(project.resolve()) == selected_output
-    assert (selected_output / "stereo_selector_review.json").is_file()
-    assert (old_output / "stereo_selector_review.json").is_file()
-    assert not list(old_output.rglob("*.png"))
-    window.close()
-
-
-def test_annotation_button_reflects_saved_tags_and_note(tmp_path: Path) -> None:
-    app = QApplication.instance() or QApplication([])
-    project = _make_project(tmp_path / "capture")
-    window = MainWindow(project)
-    app.processEvents()
-    window.set_product_mode("review")
-    assert window.review_store is not None
-    sample = window.dataset.samples[0]
-
-    window.review_store.set_annotation(sample, ["模糊"], "边缘需要复查")
-    window._show_current()
-
-    assert window.annotation_button.text() == "缺陷与备注 · 2"
-    assert "模糊" in window.annotation_button.toolTip()
-    assert "边缘需要复查" in window.annotation_button.toolTip()
-    window.close()
-
-
 def test_inspection_tools_link_images_and_report_depth_quality(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     project = _make_project(tmp_path / "capture")
@@ -610,10 +631,9 @@ def test_inspection_tools_link_images_and_report_depth_quality(tmp_path: Path) -
     window = MainWindow(project)
     window.show()
     app.processEvents()
-    window.set_product_mode("review")
-    QThreadPool.globalInstance().waitForDone(5000)
+    workers.wait_for_all(5000)
     app.processEvents()
-    QThreadPool.globalInstance().waitForDone(5000)
+    workers.wait_for_all(5000)
     app.processEvents()
 
     assert not window.inspection_bar.isHidden()
@@ -626,7 +646,7 @@ def test_inspection_tools_link_images_and_report_depth_quality(tmp_path: Path) -
     assert "零值" in window.depth_quality_label.text()
     assert "（" not in window.depth_quality_label.text()
     window.checkboxes["depth_fsd"].setChecked(True)
-    QThreadPool.globalInstance().waitForDone(5000)
+    workers.wait_for_all(5000)
     app.processEvents()
     assert "范围" in window.depth_quality_label.text()
     assert "零值" in window.depth_quality_label.text()
@@ -634,32 +654,54 @@ def test_inspection_tools_link_images_and_report_depth_quality(tmp_path: Path) -
     window.crosshair_button.setChecked(True)
     assert (
         window.tiles["left"].image_canvas.viewport().cursor().shape()
-        == Qt.CursorShape.BlankCursor
+        == Qt.CursorShape.ArrowCursor
     )
     window._media_cursor_moved("left", 0.5, 0.5)
     assert "RGB" in window.cursor_info.text()
     assert "深度" in window.cursor_info.text()
     assert window.tiles["left"].image_canvas._crosshair_vertical.isVisible()
+    assert window.cursor_info.minimumWidth() == window.cursor_info.maximumWidth()
+    assert not window.cursor_info_row.isHidden()
+    assert window.inspection_bar.height() > 38
+    cursor_origin = window.cursor_info.mapTo(window.cursor_info_row, QPoint(0, 0))
+    assert cursor_origin.x() + window.cursor_info.width() <= window.cursor_info_row.width()
+    readout_labels = (
+        window.cursor_info.position_label,
+        window.cursor_info.stereo_label,
+        window.cursor_info.rgb_label,
+        window.cursor_info.depth_label,
+        window.cursor_info.xyz_label,
+    )
+    readout_geometries = tuple(label.geometry() for label in readout_labels)
+    window._media_cursor_moved("left", 0.25, 0.25)
+    window._media_cursor_moved("left", 0.75, 0.75)
+    QTest.qWait(20)
+    app.processEvents()
+    assert window._crosshair_position == (0.75, 0.75)
+    assert tuple(label.geometry() for label in readout_labels) == readout_geometries
 
     window.checkboxes["depth_color"].setChecked(True)
-    QThreadPool.globalInstance().waitForDone(5000)
+    workers.wait_for_all(5000)
     app.processEvents()
     window._media_cursor_moved("depth_color", 0.5, 0.5)
+    QTest.qWait(20)
+    app.processEvents()
     assert "RGB" in window.cursor_info.text()
     assert "深度" in window.cursor_info.text()
 
     window.epiline_button.setChecked(True)
     window._media_cursor_moved("left", 0.5, 0.5)
+    QTest.qWait(20)
+    app.processEvents()
     assert window.tiles["right"].image_canvas._epiline.isVisible()
 
     window.sync_views_button.setChecked(True)
     window._media_view_changed("left", 2.0, 0.4, 0.6)
     assert window.tiles["right"].image_canvas._zoom_factor == 2.0
 
-    annotation_center = window.annotation_button.mapTo(window, window.annotation_button.rect().center()).y()
-    accept_center = window.accept_button.mapTo(window, window.accept_button.rect().center()).y()
-    assert abs(annotation_center - accept_center) <= 1
     window.crosshair_button.setChecked(False)
+    assert window.cursor_info_row.isHidden()
+    assert window.inspection_bar.height() == 38
     assert (
         window.tiles["left"].image_canvas.viewport().cursor().shape()
         == Qt.CursorShape.OpenHandCursor
@@ -681,13 +723,13 @@ def test_cached_depth_quality_is_not_overwritten_by_loading_state(tmp_path: Path
     window = MainWindow(project)
     window.show()
     app.processEvents()
-    QThreadPool.globalInstance().waitForDone(5000)
+    workers.wait_for_all(5000)
     app.processEvents()
 
     window.next_sample()
-    QThreadPool.globalInstance().waitForDone(5000)
+    workers.wait_for_all(5000)
     app.processEvents()
-    QThreadPool.globalInstance().waitForDone(5000)
+    workers.wait_for_all(5000)
     app.processEvents()
     assert "65535" in window.depth_quality_label.text()
 
@@ -704,11 +746,20 @@ def test_timeline_playback_advances_loaded_frames_and_stops_at_end(tmp_path: Pat
     window = MainWindow(project)
     window.show()
     app.processEvents()
-    QThreadPool.globalInstance().waitForDone(5000)
+    workers.wait_for_all(5000)
     app.processEvents()
 
     window.playback_speed.setCurrentIndex(window.playback_speed.findData(0.5))
     assert not window.timeline.hasTracking()
+    window.timeline.setFixedWidth(300)
+    QTest.mouseClick(
+        window.timeline,
+        Qt.MouseButton.LeftButton,
+        pos=QPoint(window.timeline.width() - 4, window.timeline.height() // 2),
+    )
+    assert window.current_index == 1
+    window.first_sample()
+    assert window.current_index == 0
     window.toggle_playback()
 
     assert window._playback_timer.isActive()
@@ -716,7 +767,7 @@ def test_timeline_playback_advances_loaded_frames_and_stops_at_end(tmp_path: Pat
     window._playback_tick()
     assert window.current_index == 1
 
-    QThreadPool.globalInstance().waitForDone(5000)
+    workers.wait_for_all(5000)
     app.processEvents()
     window._playback_tick()
 
@@ -738,14 +789,18 @@ def test_sidebar_and_inspection_toolbar_fold_with_reversible_animation(
     assert window.sidebar_panel.isHidden()
     assert not window.sidebar.isHidden()
     window.toggle_sidebar()
+    assert window._sidebar_animation is None
+    assert not window.project_panel.isHidden()
     QTest.qWait(240)
     assert not window.sidebar_panel.isHidden()
     assert window.sidebar.width() >= 238
     window.toggle_sidebar()
-    QTest.qWait(240)
+    assert window.project_panel.isHidden()
     assert window.sidebar_panel.isHidden()
     assert not window.sidebar.isHidden()
     assert window.sidebar.width() <= 42
+    icon_position = window.activity_buttons["data"].mapTo(window.sidebar, QPoint(0, 0))
+    assert icon_position.x() <= 3
 
     window.toggle_topbar()
     QTest.qWait(220)
@@ -782,52 +837,33 @@ def test_main_page_can_switch_builtin_calibration_per_project(tmp_path: Path) ->
     window.close()
 
 
-def test_product_mode_defaults_to_view_and_is_remembered_per_project(
+def test_project_collection_opens_first_child_and_switches_from_header(
     tmp_path: Path,
 ) -> None:
     app = QApplication.instance() or QApplication([])
-    project = _make_project(tmp_path / "capture")
-    settings_path = tmp_path / "mode.ini"
+    collection = tmp_path / "20260805"
+    first = _make_project(collection / "140514")
+    second = _make_project(collection / "140534")
     window = MainWindow()
-    window.settings = QSettings(str(settings_path), QSettings.Format.IniFormat)
-    window.load_project(project)
 
-    assert window.product_mode == "view"
-    assert window.review_controls.isHidden()
-    assert window.review_store is None
-    assert not (project.parent / "capture_select" / "stereo_selector_review.json").exists()
-
-    window.set_product_mode("review")
-    assert not window.review_controls.isHidden()
-    assert window.review_store is not None
-    window.close()
-
-    reopened = MainWindow()
-    reopened.settings = QSettings(str(settings_path), QSettings.Format.IniFormat)
-    reopened.load_project(project)
-
-    assert reopened.product_mode == "review"
-    assert not reopened.review_controls.isHidden()
-    reopened.close()
-
-
-def test_review_mode_supports_rejected_and_pending_states(tmp_path: Path) -> None:
-    app = QApplication.instance() or QApplication([])
-    project = _make_project(tmp_path / "capture")
-    window = MainWindow(project)
+    window.load_project(collection)
     app.processEvents()
-    window.set_product_mode("review")
-    window.preferences.auto_advance = False
 
-    window.set_review_status("rejected")
-    sample = window.dataset.samples[0]
-    assert window.review_store.get(sample)["status"] == "rejected"
-    assert window.review_bar.property("reviewState") == "rejected"
-    assert window.sample_status.text() == "已拒绝"
+    assert window.project_collection_root == collection.resolve()
+    assert window.project_roots == [first.resolve(), second.resolve()]
+    assert window.dataset is not None
+    assert window.dataset.root == first.resolve()
+    assert not window.project_picker.isHidden()
+    assert window.project_picker.count() == 2
+    assert window.project_picker.currentText() == "140514"
 
-    window.set_review_status("pending")
-    assert window.review_store.get(sample)["status"] == "pending"
-    assert window.review_bar.property("reviewState") == "pending"
+    window.project_picker.setCurrentIndex(1)
+    app.processEvents()
+
+    assert window.dataset is not None
+    assert window.dataset.root == second.resolve()
+    assert window.project_picker.currentText() == "140534"
+    assert "项目 2/2" in window.project_summary_label.text()
     window.close()
 
 
@@ -836,9 +872,9 @@ def test_compact_view_chrome_and_analysis_inspector(tmp_path: Path) -> None:
     project = _make_project(tmp_path / "capture")
     window = MainWindow(project)
     window.show()
-    QThreadPool.globalInstance().waitForDone(5000)
+    workers.wait_for_all(5000)
     app.processEvents()
-    QThreadPool.globalInstance().waitForDone(5000)
+    workers.wait_for_all(5000)
     app.processEvents()
 
     assert window.sidebar.width() <= 42
@@ -850,10 +886,58 @@ def test_compact_view_chrome_and_analysis_inspector(tmp_path: Path) -> None:
     window.toggle_chrome()
     assert window._chrome_hidden
     assert window.title_bar.isHidden()
-    assert window.review_bar.isHidden()
+    assert window.player_bar.isHidden()
     window.toggle_chrome()
     assert not window._chrome_hidden
     assert not window.title_bar.isHidden()
+    window.close()
+
+
+def test_activity_bar_separates_image_and_cloud_tool_families(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    project = _make_project(tmp_path / "capture")
+    ply = project / "ply" / "frame_0001.ply"
+    ply.parent.mkdir()
+    ply.write_text(
+        "ply\nformat ascii 1.0\nelement vertex 1\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "end_header\n0 0 1\n",
+        encoding="ascii",
+    )
+    window = MainWindow(project)
+    window.show()
+    workers.wait_for_all(5000)
+    app.processEvents()
+
+    assert {
+        "data",
+        "display",
+        "adjust",
+        "measure",
+        "statistics",
+    } <= set(window.activity_buttons)
+    assert "stereo" not in window.activity_buttons
+    assert window.overlay_button.parentWidget() is window.inspection_tools_row
+    assert window.inspection_tools_row.parentWidget() is window.inspection_bar
+
+    window._select_activity("statistics")
+    app.processEvents()
+    assert window.inspector.isVisible()
+    assert window.inspector._category == "statistics"
+    assert not window.inspector.analysis_section.isHidden()
+    assert window.inspector.cloud_section.isHidden()
+
+    window.checkboxes["ply"].setChecked(True)
+    workers.wait_for_all(5000)
+    app.processEvents()
+    window._select_activity("adjust")
+    window.inspector.source_picker.setCurrentIndex(window.inspector.source_picker.findData("ply"))
+    app.processEvents()
+    assert window.inspector._category == "adjust"
+    assert not window.inspector.cloud_section.isHidden()
+    assert window.inspector.source_picker.currentData() == "ply"
     window.close()
 
 

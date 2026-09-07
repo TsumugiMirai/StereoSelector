@@ -1,5 +1,6 @@
 from string import Template
 
+from PySide6.QtGui import QColor, QPalette
 
 PALETTES = {
     "dark": {
@@ -40,13 +41,6 @@ PALETTES = {
         "media_border": "#2a2b2c",
         "media_text": "#ededed",
         "media_muted": "#8c8c8c",
-        "accepted_bar_start": "#14231a",
-        "accepted_bar_end": "#17271d",
-        "accepted_border": "#4f9a6a",
-        "accepted_text": "#8bd9a8",
-        "rejected_bar": "#29191a",
-        "rejected_border": "#a64c55",
-        "rejected_text": "#f0a0a7",
     },
     "light": {
         "window": "#fafafd",
@@ -86,13 +80,6 @@ PALETTES = {
         "media_border": "#d8d8d8",
         "media_text": "#202020",
         "media_muted": "#606060",
-        "accepted_bar_start": "#e3f2e7",
-        "accepted_bar_end": "#e9f5eb",
-        "accepted_border": "#86bf99",
-        "accepted_text": "#267347",
-        "rejected_bar": "#fbedee",
-        "rejected_border": "#d28a90",
-        "rejected_text": "#9b3943",
     },
 }
 
@@ -100,7 +87,8 @@ PALETTES = {
 STYLE = Template(r"""
 QWidget {
     color: $text;
-    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+                 "PingFang SC", "Noto Sans CJK SC", "Helvetica Neue", "DejaVu Sans", sans-serif;
     font-size: 12px;
 }
 QMainWindow { background: $window; }
@@ -109,8 +97,13 @@ QWidget#workspace { background: $surface; }
 QWidget#mediaWorkspace { background: $media_workspace; }
 QToolTip {
     background: $panel; color: $text; border: 1px solid $border_strong;
-    border-radius: 6px; padding: 5px 8px;
+    padding: 5px 8px;
 }
+QWidget#toolTipWindow { background: transparent; }
+QFrame#appToolTip {
+    background: $panel; border: 1px solid $border_strong; border-radius: 8px;
+}
+QLabel#appToolTipText { background: transparent; color: $text; border: 0; }
 
 QFrame#titleBar { background: $window; border-bottom: 1px solid $border; }
 QLabel#titleMark { background: $primary; color: $primary_text; border-radius: 6px; font-size: 10px; font-weight: 700; }
@@ -149,10 +142,15 @@ QLabel#countBadge { background: $elevated; color: $muted; border-radius: 7px; pa
 
 QFrame#workspaceHeader { background: $surface; border-bottom: 1px solid $border; }
 QFrame#inspectionBar { background: $surface; border-bottom: 1px solid $border; }
+QFrame#inspectionToolsRow, QFrame#cursorInfoRow { background: transparent; border: 0; }
 QLabel#breadcrumb { color: $text; font-weight: 600; }
 QLabel#viewHint { color: $muted; font-size: 11px; }
 QLabel#toolMeta { color: $faint; font-size: 11px; padding-left: 4px; }
-QLabel#cursorInfo { color: $muted; font-family: "Cascadia Mono", "Consolas"; font-size: 11px; }
+QFrame#cursorInfo { background: transparent; border: 0; }
+QLabel#cursorInfoCell {
+    background: transparent; border: 0; color: $muted;
+    font-family: "Cascadia Mono", "Consolas"; font-size: 10px;
+}
 QLabel#qualitySummary {
     background: $panel; color: $muted; border: 1px solid $border;
     border-radius: 6px; padding: 7px 8px; font-size: 11px;
@@ -162,14 +160,15 @@ QPushButton#sideToggleButton {
     border-radius: 6px; padding: 0; font-size: 20px;
 }
 QPushButton#sideToggleButton:hover { background: $hover; border-color: $border; color: $text; }
-QPushButton#modePicker, QPushButton#layoutPicker {
+QPushButton#projectPicker, QPushButton#layoutPicker,
+QPushButton#calibrationPicker {
     min-height: 26px; background: transparent; color: $text; border: 1px solid transparent;
     border-radius: 6px; padding: 0 24px 0 8px; text-align: left;
 }
-QPushButton#modePicker:hover, QPushButton#layoutPicker:hover {
+QPushButton#projectPicker:hover, QPushButton#layoutPicker:hover, QPushButton#calibrationPicker:hover {
     background: $hover; border-color: $border;
 }
-QPushButton#modePicker:focus, QPushButton#layoutPicker:focus { border-color: $focus; }
+QPushButton#projectPicker:focus, QPushButton#layoutPicker:focus, QPushButton#calibrationPicker:focus { border-color: $focus; }
 QPushButton#toolIconButton {
     min-height: 26px; background: transparent; border: 1px solid transparent;
     border-radius: 6px; padding: 0;
@@ -178,42 +177,13 @@ QPushButton#toolIconButton:hover { background: $hover; border-color: $border; }
 QPushButton#toolIconButton:checked { background: $nav_selected; border-color: $focus; }
 QPushButton#toolIconButton:disabled { background: transparent; border-color: transparent; }
 
-QFrame#reviewBar {
+QFrame#playerBar {
     background: $surface; border-top: 1px solid $border;
 }
-QFrame#reviewBar[reviewState="accepted"] {
-    background: qlineargradient(
-        x1: 0, y1: 0, x2: 1, y2: 0,
-        stop: 0 $accepted_bar_start, stop: 1 $accepted_bar_end
-    );
-    border-top: 2px solid $accepted_border;
-}
-QFrame#reviewBar[reviewState="rejected"] {
-    background: $rejected_bar; border-top: 2px solid $rejected_border;
-}
-QLabel#sampleTitle { color: $text; font-size: 14px; font-weight: 600; }
 QLabel#sampleMeta { color: $muted; font-size: 11px; }
-QLabel#statusPill {
-    background: transparent; color: $muted; border: 1px solid $border_strong;
-    border-radius: 9px; padding: 1px 8px; font-size: 11px;
-}
-QLabel#statusPill[accepted="true"] {
-    background: transparent; border-color: $accepted_border; color: $accepted_text;
-}
-QLabel#statusPill[reviewStatus="rejected"] {
-    border-color: $rejected_border; color: $rejected_text;
-}
-QFrame#reviewBar[reviewState="accepted"] QLabel#sampleTitle {
-    color: $accepted_text;
-}
-QFrame#reviewBar[reviewState="rejected"] QLabel#sampleTitle { color: $rejected_text; }
-QFrame#reviewBar[reviewState="accepted"] QPushButton#acceptButton {
-    background: $accepted_border; border-color: $accepted_border;
-}
 QFrame#timelinePanel {
     background: $surface; border: 0; border-radius: 0;
 }
-QFrame#reviewControls { background: transparent; }
 QLabel#playerStatus { color: $muted; font-size: 11px; padding-left: 4px; }
 QPushButton#playbackButton {
     background: transparent; border: 1px solid transparent; border-radius: 6px;
@@ -229,14 +199,17 @@ QPushButton#playbackButton:disabled {
     background: transparent; border-color: transparent; color: $disabled;
 }
 QSlider#timelineSlider::groove:horizontal {
-    background: $border_strong; height: 3px; border-radius: 1px;
+    background: $border_strong; height: 4px; border-radius: 2px;
 }
 QSlider#timelineSlider::sub-page:horizontal {
-    background: $accent; border-radius: 1px;
+    background: $accent; border-radius: 2px;
 }
 QSlider#timelineSlider::handle:horizontal {
-    background: $text; border: 2px solid $surface; width: 11px;
-    margin: -6px 0; border-radius: 7px;
+    background: $text; border: 2px solid $surface; width: 12px;
+    margin: -6px 0; border-radius: 8px;
+}
+QSlider#timelineSlider::handle:horizontal:hover {
+    background: $accent; border-color: $surface;
 }
 QPushButton#playbackSpeed {
     min-height: 26px; background: transparent; color: $text;
@@ -278,13 +251,6 @@ QPushButton#primaryButton {
     font-weight: 600; padding: 0 12px;
 }
 QPushButton#primaryButton:hover { background: $primary_hover; border-color: $primary_hover; }
-QPushButton#acceptButton {
-    background: $success; color: $on_success; border-color: $success;
-    font-weight: 600; padding: 0 14px;
-}
-QPushButton#acceptButton:hover { background: $success_hover; border-color: $success_hover; }
-QPushButton#rejectButton { background: transparent; color: $rejected_text; border-color: $rejected_border; }
-QPushButton#rejectButton:hover { background: $rejected_bar; }
 QPushButton#ghostButton { background: transparent; border-color: transparent; color: $muted; }
 QPushButton#ghostButton:hover { background: $hover; color: $text; }
 QPushButton#secondaryButton { background: $elevated; border-color: $border; color: $text; }
@@ -310,9 +276,11 @@ QCheckBox::indicator { width: 14px; height: 14px; }
 QCheckBox::indicator:unchecked { border: 1px solid $border_strong; background: $input; border-radius: 3px; }
 QCheckBox::indicator:checked { border: 1px solid $focus; background: $focus; border-radius: 3px; }
 
-QSlider::groove:horizontal { background: $border_strong; height: 3px; border-radius: 1px; }
-QSlider::sub-page:horizontal { background: $focus; }
-QSlider::handle:horizontal { background: $text; border: 2px solid $surface; width: 11px; margin: -5px 0; border-radius: 7px; }
+QSlider::groove:horizontal { background: $border_strong; height: 4px; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: $accent; border-radius: 2px; }
+QSlider::handle:horizontal { background: $text; border: 1px solid $surface; width: 12px; margin: -5px 0; border-radius: 6px; }
+QSlider::handle:horizontal:hover, QSlider::handle:horizontal:pressed { background: $focus; }
+QSlider::handle:horizontal:disabled { background: $disabled; }
 QSplitter::handle { background: $border; }
 QStatusBar { background: $window; color: $muted; border-top: 1px solid $border; }
 QStatusBar::item { border: 0; }
@@ -396,7 +364,9 @@ QListWidget#settingsNav::item {
 }
 QListWidget#settingsNav::item:hover { background: $hover; color: $text; }
 QListWidget#settingsNav::item:selected { background: $nav_selected; color: $text; }
-QWidget#settingsPages { background: $surface; }
+QWidget#settingsPages, QScrollArea#settingsScroll, QWidget#settingsScrollBody {
+    background: $surface; border: 0;
+}
 QLabel#settingsPageTitle { color: $text; font-size: 18px; font-weight: 600; }
 QLabel#settingsDescription { color: $muted; }
 QFrame#settingsFooter {
@@ -433,28 +403,34 @@ QPushButton#choiceButton, QPushButton#settingsCombo {
 }
 QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QKeySequenceEdit:focus,
 QPushButton#choiceButton:focus, QPushButton#settingsCombo:focus { border-color: $focus; }
-QPushButton#calibrationPicker {
-    min-height: 26px; padding: 0 24px 0 8px; background: $input;
-    border: 1px solid $border_strong; border-radius: 6px; text-align: left;
-}
-QPushButton#calibrationPicker:hover, QPushButton#choiceButton:hover, QPushButton#settingsCombo:hover {
+QPushButton#choiceButton:hover, QPushButton#settingsCombo:hover {
     background: $hover; border-color: $border_strong;
 }
+QPushButton#choiceButton[popupOpen="true"], QPushButton#settingsCombo[popupOpen="true"],
+QPushButton#projectPicker[popupOpen="true"], QPushButton#layoutPicker[popupOpen="true"], QPushButton#calibrationPicker[popupOpen="true"],
+QPushButton#playbackSpeed[popupOpen="true"] {
+    background: $nav_selected; border-color: $focus;
+}
 QPushButton#choiceButton, QPushButton#settingsCombo { text-align: left; }
-QMenu#choiceMenu {
-    background: $panel; color: $text; border: 1px solid $border_strong;
-    border-radius: 8px; padding: 5px;
+QFrame#choicePopup {
+    background: transparent; border: 0;
 }
-QMenu#choiceMenu::item {
-    min-height: 24px; padding: 4px 28px 4px 8px; border-radius: 5px;
+QFrame#choicePopupSurface {
+    background: $panel; border: 1px solid $border_strong; border-radius: 9px;
 }
-QMenu#choiceMenu::item:selected {
+QScrollArea#choicePopupScroll, QWidget#choicePopupBody {
+    background: transparent; border: 0;
+}
+QPushButton#choiceOption {
+    min-height: 32px; background: transparent; color: $text; border: 0;
+    border-radius: 6px; padding: 0 30px 0 10px; text-align: left;
+}
+QPushButton#choiceOption:hover, QPushButton#choiceOption[active="true"] {
     background: $hover; color: $text;
 }
-QMenu#choiceMenu::item:checked {
+QPushButton#choiceOption:checked {
     background: $nav_selected; color: $text; font-weight: 600;
 }
-QMenu#choiceMenu::indicator { width: 0; height: 0; }
 QLabel#calibrationDetail {
     background: $elevated; color: $muted; border: 1px solid $border;
     border-radius: 6px; padding: 8px 10px;
@@ -471,3 +447,30 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 
 def style_for(theme: str) -> str:
     return STYLE.substitute(PALETTES.get(theme, PALETTES["dark"]))
+
+
+def palette_for(theme: str) -> QPalette:
+    """Palette built from theme tokens for custom-painted widgets.
+
+    Qt style sheets do not reliably update palette roles, so custom paint
+    code (icons, chevrons, spinners) reads these roles instead of guessing.
+    """
+    tokens = PALETTES.get(theme, PALETTES["dark"])
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor(tokens["window"]))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(tokens["text"]))
+    palette.setColor(QPalette.ColorRole.Base, QColor(tokens["input"]))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(tokens["panel"]))
+    palette.setColor(QPalette.ColorRole.Text, QColor(tokens["text"]))
+    palette.setColor(QPalette.ColorRole.Button, QColor(tokens["panel"]))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor(tokens["text"]))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(tokens["panel"]))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(tokens["text"]))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(tokens["focus"]))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(tokens["text"]))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(tokens["muted"]))
+    disabled = QPalette.ColorGroup.Disabled
+    palette.setColor(disabled, QPalette.ColorRole.Text, QColor(tokens["disabled"]))
+    palette.setColor(disabled, QPalette.ColorRole.ButtonText, QColor(tokens["disabled"]))
+    palette.setColor(disabled, QPalette.ColorRole.WindowText, QColor(tokens["disabled"]))
+    return palette

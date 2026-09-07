@@ -7,7 +7,7 @@ from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
 from PySide6.QtGui import QVector4D
 from PySide6.QtWidgets import QApplication
 
-from stereo_selector import widgets as widgets_module
+from stereo_selector import workers as workers_module
 from stereo_selector.media import (
     PointCloudData,
     analyze_depth,
@@ -19,15 +19,15 @@ from stereo_selector.media import (
     project_camera_points,
     render_image_values,
 )
+from stereo_selector.media_tile import MediaTile
 from stereo_selector.widgets import (
     CAMERA_ALIGNED_AZIMUTH,
     CAMERA_ALIGNED_ELEVATION,
-    MediaLoadWorker,
-    MediaTile,
     PinholeProjectionMixin,
     PointCloudCanvas,
     camera_points_to_gl,
 )
+from stereo_selector.workers import MediaLoadWorker
 
 TEST_INTRINSICS = np.array(
     [[100.0, 0.0, 500.0], [0.0, 100.0, 500.0], [0.0, 0.0, 1.0]],
@@ -566,11 +566,9 @@ def test_prefetched_cloud_worker_is_reused_when_it_becomes_current(
             return True
 
     pool = FakePool()
-    monkeypatch.setattr(
-        widgets_module,
-        "QThreadPool",
-        SimpleNamespace(globalInstance=lambda: pool),
-    )
+    monkeypatch.setattr(workers_module, "IMAGE_POOL", pool)
+    monkeypatch.setattr(workers_module, "CLOUD_POOL", pool)
+    monkeypatch.setattr(workers_module, "ANALYSIS_POOL", pool)
     tile = MediaTile("ply")
 
     tile.prefetch_file(path)

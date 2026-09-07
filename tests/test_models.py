@@ -1,8 +1,10 @@
 from pathlib import Path
 
-import pytest
-
-from stereo_selector.models import DatasetScanner, copy_sample, normalized_sample_key, sample_is_copied
+from stereo_selector.models import (
+    DatasetScanner,
+    discover_project_roots,
+    normalized_sample_key,
+)
 
 
 def test_normalized_sample_key_matches_modalities() -> None:
@@ -14,7 +16,7 @@ def test_normalized_sample_key_matches_modalities() -> None:
     assert normalized_sample_key(Path("1_DepthColor_1016709146_0_0_0_0.jpg")) == "1_1016709146_0_0_0_0"
 
 
-def test_scan_and_copy_preserves_structure(tmp_path: Path) -> None:
+def test_scan_is_read_only_and_preserves_source_structure(tmp_path: Path) -> None:
     root = tmp_path / "capture"
     for folder, filename in (
         ("left", "left_0001.png"),
@@ -32,13 +34,8 @@ def test_scan_and_copy_preserves_structure(tmp_path: Path) -> None:
     assert len(dataset.samples) == 1
     assert set(dataset.samples[0].files) == set(dataset.available_modalities)
 
-    copied = copy_sample(dataset, dataset.samples[0])
-    assert len(copied) == 5
-    assert (tmp_path / "capture_select" / "left" / "left_0001.png").read_bytes() == b"test"
-    assert sample_is_copied(dataset, dataset.samples[0])
-    copied[0].write_bytes(b"x")
-    assert not sample_is_copied(dataset, dataset.samples[0])
-    assert not list(dataset.output_root.rglob("*.stereoselector-copying"))
+    assert not (tmp_path / "capture_select").exists()
+    assert all(path.read_bytes() == b"test" for path in dataset.samples[0].files.values())
 
 
 def test_recursive_scene_folders_match(tmp_path: Path) -> None:
@@ -128,29 +125,6 @@ def test_manual_directories_can_force_positional_matching(tmp_path: Path) -> Non
     assert all(set(sample.files) == {"left", "right"} for sample in dataset.samples)
 
 
-def test_custom_output_root_is_used_for_all_copied_files(tmp_path: Path) -> None:
-    root = tmp_path / "capture"
-    source = root / "left" / "frame_0001.png"
-    source.parent.mkdir(parents=True)
-    source.write_bytes(b"image")
-    output_root = tmp_path / "exports" / "reviewed_capture"
-
-    dataset = DatasetScanner().scan(root, output_root=output_root)
-    copied = copy_sample(dataset, dataset.samples[0])
-
-    assert dataset.output_root == output_root.resolve()
-    assert copied == [output_root.resolve() / "left" / "frame_0001.png"]
-    assert copied[0].read_bytes() == b"image"
-
-
-def test_output_root_cannot_be_inside_project(tmp_path: Path) -> None:
-    root = tmp_path / "capture"
-    (root / "left").mkdir(parents=True)
-
-    with pytest.raises(ValueError, match="不能位于项目文件夹内部"):
-        DatasetScanner().scan(root, output_root=root / "selected")
-
-
 def test_unconventional_partial_folders_are_inferred_from_names_and_formats(tmp_path: Path) -> None:
     root = tmp_path / "capture"
     files = (
@@ -164,8 +138,8 @@ def test_unconventional_partial_folders_are_inferred_from_names_and_formats(tmp_
         path = root / folder / name
         path.parent.mkdir(parents=True, exist_ok=True)
         if folder == "metric_maps":
-            from PIL import Image
             import numpy as np
+            from PIL import Image
 
             Image.fromarray(np.array([[1000]], dtype=np.uint16)).save(path)
         else:
@@ -175,3 +149,38 @@ def test_unconventional_partial_folders_are_inferred_from_names_and_formats(tmp_
 
     assert dataset.available_modalities == ["left", "right", "depth_fsd", "depth_color", "ply"]
     assert all(len(dataset.files[name]) == 1 for name in dataset.available_modalities)
+
+
+def test_project_collection_discovers_switchable_children_in_natural_order(
+    tmp_path: Path,
+) -> None:
+    collection = tmp_path / "daily_capture"
+    for project_name in ("run_10", "run_2"):
+        for folder in ("camera-left-stream", "camera-right-stream"):
+            path = collection / project_name / "sensors" / folder / "frame_0001.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"rgb")
+    exported = collection / "run_2_select"
+    for folder in ("left", "right"):
+        path = exported / folder / "frame_0001.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"copy")
+
+    projects = discover_project_roots(collection)
+
+    assert [path.name for path in projects] == ["run_2", "run_10"]
+
+
+def test_single_project_with_arbitrary_view_folder_names_stays_one_project(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "capture"
+    for folder in ("device-camera-left", "device-camera-right"):
+        path = root / "streams" / folder / "frame_0001.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"rgb")
+
+    assert discover_project_roots(root) == [root.resolve()]
+    dataset = DatasetScanner().scan(root)
+    assert dataset.available_modalities == ["left", "right"]
+    assert len(dataset.samples) == 1

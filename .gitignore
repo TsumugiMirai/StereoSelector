@@ -6,3 +6,5 @@ build/
 dist/
 *.egg-info/
 calibration/**/*.pfm
+version_info.txt
+build/version_info.txt

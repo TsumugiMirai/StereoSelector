@@ -4,6 +4,7 @@ import argparse
 import ctypes
 import hashlib
 import json
+import logging
 import math
 import os
 import sys
@@ -12,20 +13,17 @@ from ctypes import wintypes
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QRectF, QSettings, QThreadPool, Qt, QTimer
-from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent, QKeySequence, QShortcut
+from PySide6.QtCore import QEvent, QPropertyAnimation, QRectF, QSettings, Qt, QTimer
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
-    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
-    QPushButton,
-    QSlider,
+    QProgressDialog,
     QSplitter,
     QStackedWidget,
     QStatusBar,
@@ -33,49 +31,67 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .models import (
-    Dataset,
-    DatasetScanner,
-    MODALITY_INFO,
-    copy_sample,
-    modality_label,
-    sample_is_copied,
-    summarize_missing,
-)
 from .calibration import (
+    RECTIFY_MODE_CHOICES,
     CalibrationData,
     CalibrationOption,
     builtin_calibration_options,
     custom_calibration_option,
+    discover_project_calibrations,
     epiline_for_point,
     load_calibration,
+    normalize_rectify_mode,
 )
-from .inspection import (
-    CloudProjectionDialog,
-    StereoOverlayDialog,
-    rectify_stereo_images,
-)
+from .inspection import CloudProjectionDialog, StereoOverlayDialog
 from .inspector import InspectorPanel
-from .media import project_camera_points
 from .mapping import MappingDialog
-from .review import AnnotationDialog, MANIFEST_FILENAME, OutputSettingsDialog, ReviewStore
-from .settings import AppPreferences, ChoiceButton, SettingsDialog
-from .theme import style_for
-from .widgets import (
-    ActivityButton,
-    CommandPalette,
-    DropHint,
-    MediaTile,
-    NoViewsHint,
-    PaneToggleButton,
-    PlaybackControlButton,
-    PointCloudCanvas,
-    TitleBar,
-    ToolIconButton,
+from .media import project_camera_points, render_image_values
+from .models import (
+    MODALITY_INFO,
+    Dataset,
+    modality_label,
+    summarize_missing,
 )
+from .playback_controller import PlaybackController
+from .settings import AppPreferences, SettingsDialog
+from .settings_controller import SettingsController
+from .theme import PALETTES, palette_for, style_for
+from .ui_controls import ElidedLabel
+from .ui_layout import build_inspector, build_sidebar, build_workspace
+from .ui_metrics import (
+    ACTIVITY_BAR_WIDTH,
+    ICON_PANE_SIZE,
+    INSPECTION_BAR_CURSOR_HEIGHT,
+    INSPECTION_BAR_HEIGHT,
+    MEDIA_COMPACT_MARGIN,
+    MEDIA_COMPACT_SPACING,
+    MEDIA_MARGIN,
+    MEDIA_SPACING,
+    SIDEBAR_EXPANDED_WIDTH,
+    SIDEBAR_MAX_WIDTH,
+    SIDEBAR_MIN_WIDTH,
+    SPLITTER_INSPECTOR_WIDTH,
+    SPLITTER_SIDEBAR_WIDTH,
+    SPLITTER_WORKSPACE_WIDTH,
+    WINDOW_DEFAULT_HEIGHT,
+    WINDOW_DEFAULT_WIDTH,
+    WINDOW_MIN_HEIGHT,
+    WINDOW_MIN_WIDTH,
+)
+from .units import depth_is_valid, depth_to_meters, format_depth, resolve_depth_unit
+from .widgets import (
+    CommandPalette,
+    MediaTile,
+    PaneToggleButton,
+    TitleBar,
+    ToolTipManager,
+)
+from .workers import IMAGE_POOL, SCAN_POOL, ProjectScanWorker, RectifyWorker, configure_pools
+
+logger = logging.getLogger(__name__)
 
 
-class MainWindow(QMainWindow):
+class MainWindow(QMainWindow, PlaybackController, SettingsController):
     def __init__(self, initial_project: Path | None = None) -> None:
         super().__init__()
         self.setWindowTitle("Stereo Selector")
@@ -85,25 +101,31 @@ class MainWindow(QMainWindow):
             | Qt.WindowType.WindowMinMaxButtonsHint
             | Qt.WindowType.WindowSystemMenuHint
         )
-        self.resize(1520, 920)
-        self.setMinimumSize(1050, 680)
+        self.resize(WINDOW_DEFAULT_WIDTH, WINDOW_DEFAULT_HEIGHT)
+        self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self.setAcceptDrops(True)
 
         self.settings = QSettings("ToolBox", "StereoSelector")
         self.preferences = AppPreferences.load(self.settings)
-        self.scanner = DatasetScanner()
         self.dataset: Dataset | None = None
         self.current_root: Path | None = None
+        self.project_collection_root: Path | None = None
+        self.project_roots: list[Path] = []
+        self._project_picker_guard = False
         self.manual_dirs: dict[str, Path] = {}
         self.force_order = False
         self.current_index = 0
-        self.accepted: set[str] = set()
-        self.review_store: ReviewStore | None = None
         self.calibration: CalibrationData | None = None
         self.current_calibration_id = ""
+        self.rectify_mode = "air"
         self.calibration_options = self._load_calibration_options()
         self.focused_modality: str | None = None
         self._crosshair_position: tuple[float, float] | None = None
+        self._pending_cursor_update: tuple[str, float, float] | None = None
+        self._cursor_update_timer = QTimer(self)
+        self._cursor_update_timer.setSingleShot(True)
+        self._cursor_update_timer.setInterval(16)
+        self._cursor_update_timer.timeout.connect(self._drain_cursor_update)
         self.checkboxes: dict[str, QCheckBox] = {}
         self.count_labels: dict[str, QLabel] = {}
         self.tiles: dict[str, MediaTile] = {}
@@ -112,30 +134,43 @@ class MainWindow(QMainWindow):
         self.action_shortcuts: dict[str, QShortcut] = {}
         self._native_frame_applied = False
         self._sidebar_animation: QPropertyAnimation | None = None
-        self._sidebar_expanded_width = 252
+        self._sidebar_expanded_width = SIDEBAR_EXPANDED_WIDTH
         self._sidebar_collapsed = True
         self._active_sidebar_page = "data"
         self._topbar_animation: QPropertyAnimation | None = None
-        self._topbar_expanded_height = 44
+        self._topbar_expanded_height = INSPECTION_BAR_HEIGHT
         self._topbar_collapsed = False
         self._playback_fps = 2.0
+        self._resume_playback_after_scrub = False
         self._playback_timer = QTimer(self)
         self._playback_timer.setInterval(500)
         self._playback_timer.timeout.connect(self._playback_tick)
         self._settings_page: SettingsDialog | None = None
         self._settings_previous_context: tuple[str, bool] = ("", False)
-        self.product_mode = "view"
         self._layout_columns = 0
         self._chrome_hidden = False
         self._chrome_visibility: dict[str, bool] = {}
         self._inspector_source = ""
         self._cloud_clip_ranges: dict[str, tuple[float, float]] | None = None
-        self._rectified_cache: dict[tuple[str, str, str], tuple[object, object]] = {}
+        self._rectified_cache: dict[tuple[str, str, str], tuple[tuple[object, object], str]] = {}
+        self._rectify_sequence = 0
+        self._rectify_token: int | None = None
+        self._rectify_key: tuple[str, str, str] | None = None
+        self._rectify_worker: RectifyWorker | None = None
+        self._scan_in_progress = False
+        self._resolution_warnings: set[tuple[str, int, int]] = set()
 
         self._build_ui()
+        self.tooltip_manager = ToolTipManager(self)
+        QApplication.instance().installEventFilter(self.tooltip_manager)
         self._build_shortcuts()
         self._apply_preferences()
         self._update_controls()
+        self._refresh_recent_projects()
+        if sys.platform != "win32":
+            # Frameless windows only get the native resize frame on Windows;
+            # other platforms use QWindow.startSystemResize from the edges.
+            self.setMouseTracking(True)
 
         if initial_project is not None:
             QTimer.singleShot(0, lambda: self.load_project(initial_project))
@@ -154,6 +189,12 @@ class MainWindow(QMainWindow):
         self.title_bar.settings_requested.connect(self.open_settings)
         self.title_bar.close_requested.connect(self.close)
         self.title_bar.settings_button.hide()
+        self.topbar_button = PaneToggleButton("up")
+        self.topbar_button.setToolTip("收起检查工具栏")
+        self.topbar_button.setEnabled(False)
+        self.topbar_button.setFixedSize(ICON_PANE_SIZE, ICON_PANE_SIZE)
+        self.topbar_button.clicked.connect(self.toggle_topbar)
+        self.title_bar.action_layout.addWidget(self.topbar_button)
         central_layout.addWidget(self.title_bar)
 
         self.page_stack = QStackedWidget()
@@ -166,7 +207,7 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         self.page_stack.addWidget(self.main_page)
-        self.status_text = QLabel("")
+        self.status_text = ElidedLabel("")
         self.status_text.setObjectName("playerStatus")
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -180,7 +221,9 @@ class MainWindow(QMainWindow):
         self.splitter.addWidget(self.sidebar)
         self.splitter.addWidget(workspace)
         self.splitter.addWidget(self.inspector)
-        self.splitter.setSizes([40, 1480, 0])
+        self.splitter.setSizes(
+            [SPLITTER_SIDEBAR_WIDTH, SPLITTER_WORKSPACE_WIDTH, SPLITTER_INSPECTOR_WIDTH]
+        )
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setStretchFactor(2, 0)
@@ -192,422 +235,21 @@ class MainWindow(QMainWindow):
         self.app_status_bar.hide()
 
     def _build_sidebar(self) -> QFrame:
-        shell = QFrame()
-        shell.setObjectName("navigationShell")
-        shell_layout = QHBoxLayout(shell)
-        shell_layout.setContentsMargins(0, 0, 0, 0)
-        shell_layout.setSpacing(0)
-        activity_bar = QFrame()
-        activity_bar.setObjectName("activityBar")
-        activity_layout = QVBoxLayout(activity_bar)
-        activity_layout.setContentsMargins(2, 4, 2, 4)
-        activity_layout.setSpacing(2)
-        self.activity_buttons: dict[str, ActivityButton] = {}
-        for name, tooltip in (
-            ("data", "数据"),
-            ("display", "显示"),
-            ("analysis", "分析"),
-            ("review", "筛选"),
-        ):
-            button = ActivityButton(name, tooltip)
-            button.clicked.connect(
-                lambda _checked=False, page=name: self._select_activity(page)
-            )
-            self.activity_buttons[name] = button
-            activity_layout.addWidget(button)
-        activity_layout.addStretch(1)
-        shell_layout.addWidget(activity_bar)
-
-        sidebar = QFrame()
-        sidebar.setObjectName("sidebar")
-        sidebar.setMinimumWidth(0)
-        sidebar.setMaximumWidth(self._sidebar_expanded_width)
-        side = QVBoxLayout(sidebar)
-        side.setContentsMargins(0, 0, 0, 0)
-        side.setSpacing(0)
-        self.sidebar_panel = sidebar
-
-        project = QWidget()
-        project.setObjectName("sidebarSection")
-        self.project_panel = project
-        project_layout = QVBoxLayout(project)
-        project_layout.setContentsMargins(14, 14, 14, 12)
-        project_layout.setSpacing(4)
-        eyebrow = QLabel("PROJECT")
-        eyebrow.setObjectName("eyebrow")
-        self.project_name_label = QLabel("未打开项目")
-        self.project_name_label.setObjectName("projectName")
-        self.project_name_label.setWordWrap(True)
-        self.project_path_label = QLabel("")
-        self.project_path_label.setObjectName("projectPath")
-        self.project_path_label.setWordWrap(True)
-        self.project_path_label.hide()
-        self.project_summary_label = QLabel("")
-        self.project_summary_label.setObjectName("muted")
-        self.project_summary_label.setWordWrap(True)
-        self.project_summary_label.hide()
-        self.change_button = QPushButton("打开项目")
-        self.change_button.setObjectName("ghostButton")
-        self.change_button.clicked.connect(self.choose_project)
-        self.change_button.hide()
-        project_layout.addWidget(eyebrow)
-        project_layout.addWidget(self.project_name_label)
-        project_layout.addWidget(self.project_path_label)
-        project_layout.addSpacing(3)
-        project_layout.addWidget(self.project_summary_label)
-        project_actions = QHBoxLayout()
-        project_actions.setSpacing(4)
-        project_actions.addWidget(self.change_button)
-        self.manual_mapping_button = QPushButton("视图映射")
-        self.manual_mapping_button.setObjectName("ghostButton")
-        self.manual_mapping_button.clicked.connect(self.open_mapping_settings)
-        self.manual_mapping_button.hide()
-        project_actions.addWidget(self.manual_mapping_button)
-        project_actions.addStretch(1)
-        project_layout.addLayout(project_actions)
-        side.addWidget(project)
-
-        self.modes_panel = QWidget()
-        self.modes_panel.setObjectName("sidebarSection")
-        modes_layout = QVBoxLayout(self.modes_panel)
-        modes_layout.setContentsMargins(14, 10, 14, 10)
-        modes_layout.setSpacing(1)
-        modes_header = QHBoxLayout()
-        modes_title = QLabel("对比视图")
-        modes_title.setObjectName("sectionLabel")
-        self.selected_count_label = QLabel("已选 0")
-        self.selected_count_label.setObjectName("muted")
-        modes_header.addWidget(modes_title)
-        modes_header.addStretch(1)
-        modes_header.addWidget(self.selected_count_label)
-        modes_layout.addLayout(modes_header)
-        modes_layout.addSpacing(5)
-        for index, modality in enumerate(MODALITY_INFO, start=1):
-            row = QHBoxLayout()
-            checkbox = QCheckBox(f"{index}   {modality_label(modality)}")
-            checkbox.setEnabled(False)
-            checkbox.toggled.connect(lambda checked, name=modality: self._modality_toggled(name, checked))
-            count = QLabel("0")
-            count.setObjectName("countBadge")
-            count.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.checkboxes[modality] = checkbox
-            self.count_labels[modality] = count
-            row.addWidget(checkbox, 1)
-            row.addWidget(count)
-            modes_layout.addLayout(row)
-        self.modes_panel.hide()
-        side.addWidget(self.modes_panel)
-
-        self.quality_panel = QWidget()
-        self.quality_panel.setObjectName("sidebarSection")
-        quality_layout = QVBoxLayout(self.quality_panel)
-        quality_layout.setContentsMargins(14, 10, 14, 10)
-        quality_layout.setSpacing(5)
-        quality_title = QLabel("深度质量")
-        quality_title.setObjectName("sectionLabel")
-        self.depth_quality_label = QLabel("")
-        self.depth_quality_label.setObjectName("qualitySummary")
-        self.depth_quality_label.setWordWrap(True)
-        quality_layout.addWidget(quality_title)
-        quality_layout.addWidget(self.depth_quality_label)
-        self.quality_panel.hide()
-        side.addWidget(self.quality_panel)
-
-        side.addStretch(1)
-
-        self.output_panel = QWidget()
-        self.output_panel.setObjectName("sidebarSection")
-        output_layout = QVBoxLayout(self.output_panel)
-        output_layout.setContentsMargins(14, 10, 14, 12)
-        output_layout.setSpacing(5)
-        output_title = QLabel("输出")
-        output_title.setObjectName("sectionLabel")
-        self.output_label = QLabel("")
-        self.output_label.setObjectName("projectPath")
-        self.output_label.setWordWrap(True)
-        self.open_output_button = QPushButton("打开输出文件夹")
-        self.open_output_button.setObjectName("ghostButton")
-        self.open_output_button.setEnabled(False)
-        self.open_output_button.clicked.connect(self.open_output_folder)
-        self.configure_output_button = QPushButton("设置输出")
-        self.configure_output_button.setObjectName("ghostButton")
-        self.configure_output_button.setEnabled(False)
-        self.configure_output_button.clicked.connect(self.configure_output)
-        output_layout.addWidget(output_title)
-        output_layout.addWidget(self.output_label)
-        output_actions = QHBoxLayout()
-        output_actions.setSpacing(4)
-        output_actions.addWidget(self.configure_output_button)
-        output_actions.addWidget(self.open_output_button)
-        output_layout.addLayout(output_actions)
-        self.output_panel.hide()
-        side.addWidget(self.output_panel)
-        sidebar.hide()
-        shell_layout.addWidget(sidebar)
-        return shell
+        return build_sidebar(self)
 
     def _build_workspace(self) -> QWidget:
-        workspace = QWidget()
-        workspace.setObjectName("workspace")
-        workspace_layout = QVBoxLayout(workspace)
-        workspace_layout.setContentsMargins(0, 0, 0, 0)
-        workspace_layout.setSpacing(0)
-
-        self.workspace_header = QFrame()
-        self.workspace_header.setObjectName("workspaceHeader")
-        self.workspace_header.setFixedHeight(0)
-        header_layout = QHBoxLayout(self.workspace_header)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(0)
-        self.sidebar_button = PaneToggleButton("left")
-        self.sidebar_button.setToolTip("收起侧栏 (Ctrl+B)")
-        self.sidebar_button.clicked.connect(self.toggle_sidebar)
-        self.sidebar_button.setParent(self.workspace_header)
-        self.sidebar_button.hide()
-        self.topbar_button = PaneToggleButton("up")
-        self.topbar_button.setToolTip("收起检查工具栏")
-        self.topbar_button.setEnabled(False)
-        self.topbar_button.clicked.connect(self.toggle_topbar)
-        self.topbar_button.setParent(self.workspace_header)
-        self.topbar_button.hide()
-        breadcrumb_box = QVBoxLayout()
-        breadcrumb_box.setSpacing(1)
-        self.header_breadcrumb = QLabel("未打开项目")
-        self.header_breadcrumb.setObjectName("breadcrumb")
-        self.header_breadcrumb.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.view_hint = QLabel("")
-        self.view_hint.setObjectName("viewHint")
-        self.view_hint.hide()
-        breadcrumb_box.addWidget(self.header_breadcrumb)
-        breadcrumb_box.addWidget(self.view_hint)
-        self.header_breadcrumb.setParent(self.workspace_header)
-        self.view_hint.setParent(self.workspace_header)
-        self.header_breadcrumb.hide()
-        self.reset_button = QPushButton("重置视图")
-        self.reset_button.setObjectName("ghostButton")
-        self.reset_button.clicked.connect(self.reset_views)
-        self.reset_button.setParent(self.workspace_header)
-        self.reset_button.hide()
-        self.open_button = QPushButton("打开项目…")
-        self.open_button.setObjectName("primaryButton")
-        self.open_button.clicked.connect(self.choose_project)
-        self.mode_picker = ChoiceButton()
-        self.mode_picker.setObjectName("modePicker")
-        self.mode_picker.setMinimumWidth(96)
-        self.mode_picker.addItem("查看模式", "view")
-        self.mode_picker.addItem("筛选模式", "review")
-        self.mode_picker.currentIndexChanged.connect(self._mode_picker_changed)
-        self.layout_picker = ChoiceButton()
-        self.layout_picker.setObjectName("layoutPicker")
-        self.layout_picker.setMinimumWidth(82)
-        for label, columns in (("自动布局", 0), ("单列", 1), ("双列", 2), ("三列", 3)):
-            self.layout_picker.addItem(label, columns)
-        self.layout_picker.currentIndexChanged.connect(self._layout_picker_changed)
-        self.header_settings_button = QPushButton("设置")
-        self.header_settings_button.setObjectName("titleActionButton")
-        self.header_settings_button.clicked.connect(self.open_settings)
-        self.title_bar.action_layout.addWidget(self.mode_picker)
-        self.title_bar.action_layout.addWidget(self.open_button)
-        self.title_bar.action_layout.addWidget(self.layout_picker)
-        self.title_bar.action_layout.addWidget(self.header_settings_button)
-        self.workspace_header.hide()
-        workspace_layout.addWidget(self.workspace_header)
-
-        self.inspection_bar = QFrame()
-        self.inspection_bar.setObjectName("inspectionBar")
-        self.inspection_bar.setFixedHeight(38)
-        inspection_layout = QHBoxLayout(self.inspection_bar)
-        inspection_layout.setContentsMargins(8, 4, 10, 4)
-        inspection_layout.setSpacing(3)
-        self.crosshair_button = ToolIconButton("crosshair", "十字光标", checkable=True)
-        self.crosshair_button.toggled.connect(self._toggle_crosshair)
-        self.sync_views_button = ToolIconButton("sync", "左右图同步缩放和平移", checkable=True)
-        self.sync_views_button.toggled.connect(self._sync_views_toggled)
-        self.epiline_button = ToolIconButton("epiline", "极线与同名像素联动", checkable=True)
-        self.epiline_button.toggled.connect(self._epilines_toggled)
-        self.rectify_button = ToolIconButton(
-            "rectify",
-            "校正前 / 校正后",
-            checkable=True,
-        )
-        self.rectify_button.toggled.connect(self._rectification_toggled)
-        self.overlay_button = ToolIconButton("overlay", "左右图透明叠加")
-        self.overlay_button.clicked.connect(
-            lambda: self.open_stereo_overlay(mode="overlay")
-        )
-        calibration_caption = QLabel("标定")
-        calibration_caption.setObjectName("toolMeta")
-        self.calibration_picker = ChoiceButton()
-        self.calibration_picker.setObjectName("calibrationPicker")
-        self.calibration_picker.setMinimumWidth(132)
-        self.calibration_picker.currentIndexChanged.connect(self._calibration_picker_changed)
-        self.cursor_info = QLabel("")
-        self.cursor_info.setObjectName("cursorInfo")
-        self.cursor_info.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        inspection_layout.addWidget(self.crosshair_button)
-        inspection_layout.addWidget(self.sync_views_button)
-        inspection_layout.addWidget(self.epiline_button)
-        inspection_layout.addWidget(self.rectify_button)
-        inspection_layout.addWidget(self.overlay_button)
-        inspection_layout.addSpacing(6)
-        inspection_layout.addWidget(calibration_caption)
-        inspection_layout.addWidget(self.calibration_picker)
-        inspection_layout.addStretch(1)
-        inspection_layout.addWidget(self.cursor_info)
-        self.inspection_bar.hide()
-        workspace_layout.addWidget(self.inspection_bar)
-
-        self.content_stack = QStackedWidget()
-        self.empty_hint = DropHint()
-        self.empty_hint.open_requested.connect(self.choose_project)
-        self.content_stack.addWidget(self.empty_hint)
-        self.media_container = QWidget()
-        self.media_container.setObjectName("mediaWorkspace")
-        self.media_grid = QGridLayout(self.media_container)
-        self.media_grid.setContentsMargins(8, 8, 8, 8)
-        self.media_grid.setSpacing(8)
-        self.no_views_hint = NoViewsHint()
-        # Create the native OpenGL child before the frameless top-level window is
-        # shown. The backend itself is imported in parallel while the splash is up.
-        self.gl_warmup = PointCloudCanvas(self.media_container)
-        self.gl_warmup.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
-        self.gl_warmup.setGeometry(0, 0, 2, 2)
-        self.gl_warmup.show()
-        self.content_stack.addWidget(self.media_container)
-        workspace_layout.addWidget(self.content_stack, 1)
-
-        self.review_bar = QFrame()
-        self.review_bar.setObjectName("reviewBar")
-        self.review_bar.setProperty("reviewState", "pending")
-        review_layout = QVBoxLayout(self.review_bar)
-        review_layout.setContentsMargins(8, 0, 8, 6)
-        review_layout.setSpacing(4)
-        self.timeline_panel = QFrame()
-        self.timeline_panel.setObjectName("timelinePanel")
-        timeline_row = QHBoxLayout(self.timeline_panel)
-        timeline_row.setContentsMargins(2, 5, 2, 5)
-        timeline_row.setSpacing(4)
-        self.playback_previous_button = PlaybackControlButton("previous")
-        self.playback_previous_button.setToolTip("上一帧")
-        self.playback_previous_button.clicked.connect(self.previous_sample)
-        self.playback_button = PlaybackControlButton("play")
-        self.playback_button.setToolTip("播放")
-        self.playback_button.clicked.connect(self.toggle_playback)
-        self.playback_next_button = PlaybackControlButton("next")
-        self.playback_next_button.setToolTip("下一帧")
-        self.playback_next_button.clicked.connect(self.next_sample)
-        self.timeline_left = QLabel("0")
-        self.timeline_left.setObjectName("sampleMeta")
-        self.timeline = QSlider(Qt.Orientation.Horizontal)
-        self.timeline.setObjectName("timelineSlider")
-        self.timeline.setRange(0, 0)
-        self.timeline.setEnabled(False)
-        self.timeline.setTracking(False)
-        self.timeline.valueChanged.connect(self._timeline_changed)
-        self.timeline.sliderMoved.connect(
-            lambda value: self.timeline_left.setText(str(value + 1))
-        )
-        self.timeline_right = QLabel("0")
-        self.timeline_right.setObjectName("sampleMeta")
-        self.playback_speed = ChoiceButton()
-        self.playback_speed.setObjectName("playbackSpeed")
-        self.playback_speed.setMinimumWidth(82)
-        for label, fps in (
-            ("0.5 fps", 0.5),
-            ("1 fps", 1.0),
-            ("2 fps", 2.0),
-            ("5 fps", 5.0),
-            ("10 fps", 10.0),
-        ):
-            self.playback_speed.addItem(label, fps)
-        self.playback_speed.setCurrentIndex(self.playback_speed.findData(2.0))
-        self.playback_speed.currentIndexChanged.connect(self._playback_speed_changed)
-        timeline_row.addWidget(self.playback_previous_button)
-        timeline_row.addWidget(self.playback_button)
-        timeline_row.addWidget(self.playback_next_button)
-        timeline_row.addSpacing(4)
-        timeline_row.addWidget(self.timeline_left)
-        timeline_row.addWidget(self.timeline, 1)
-        timeline_row.addWidget(self.timeline_right)
-        timeline_row.addSpacing(4)
-        timeline_row.addWidget(self.playback_speed)
-        self.status_text.setMinimumWidth(90)
-        self.status_text.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        timeline_row.addWidget(self.status_text)
-        review_layout.addWidget(self.timeline_panel)
-
-        self.review_controls = QFrame()
-        self.review_controls.setObjectName("reviewControls")
-        controls = QHBoxLayout(self.review_controls)
-        controls.setContentsMargins(2, 2, 2, 0)
-        controls.setSpacing(6)
-        self.previous_button = QPushButton("上一组")
-        self.previous_button.clicked.connect(self.previous_sample)
-        self.next_button = QPushButton("下一组")
-        self.next_button.clicked.connect(self.next_sample)
-        sample_box = QVBoxLayout()
-        sample_box.setSpacing(1)
-        sample_top = QHBoxLayout()
-        self.sample_title = QLabel("")
-        self.sample_title.setObjectName("sampleTitle")
-        self.sample_status = QLabel("")
-        self.sample_status.setObjectName("statusPill")
-        self.sample_status.setProperty("accepted", False)
-        self.annotation_button = QPushButton("缺陷与备注")
-        self.annotation_button.setObjectName("ghostButton")
-        self.annotation_button.clicked.connect(self.open_annotation)
-        sample_top.addWidget(self.sample_title)
-        sample_top.addWidget(self.sample_status)
-        sample_top.addStretch(1)
-        self.sample_meta = QLabel("")
-        self.sample_meta.setObjectName("sampleMeta")
-        sample_box.addLayout(sample_top)
-        sample_box.addWidget(self.sample_meta)
-        self.accept_button = QPushButton("接受")
-        self.accept_button.setObjectName("acceptButton")
-        self.accept_button.clicked.connect(self.accept_current)
-        self.pending_button = QPushButton("待定")
-        self.pending_button.setObjectName("secondaryButton")
-        self.pending_button.clicked.connect(lambda: self.set_review_status("pending"))
-        self.reject_button = QPushButton("拒绝")
-        self.reject_button.setObjectName("rejectButton")
-        self.reject_button.clicked.connect(lambda: self.set_review_status("rejected"))
-        controls.addWidget(self.previous_button)
-        controls.addWidget(self.next_button)
-        controls.addSpacing(10)
-        controls.addLayout(sample_box, 1)
-        controls.addWidget(self.annotation_button)
-        controls.addWidget(self.pending_button)
-        controls.addWidget(self.reject_button)
-        controls.addWidget(self.accept_button)
-        review_layout.addWidget(self.review_controls)
-        self.review_bar.hide()
-        workspace_layout.addWidget(self.review_bar)
-        return workspace
+        return build_workspace(self)
 
     def _build_inspector(self) -> InspectorPanel:
-        inspector = InspectorPanel()
-        inspector.close_requested.connect(self.close_inspector)
-        inspector.source_changed.connect(self._inspector_source_changed)
-        inspector.display_changed.connect(self._apply_display_settings)
-        inspector.fit_requested.connect(self._fit_requested)
-        inspector.tool_requested.connect(self._tool_requested)
-        inspector.export_requested.connect(self.export_current_view)
-        inspector.stereo_action_requested.connect(self._stereo_action)
-        inspector.cloud_color_changed.connect(self._cloud_color_changed)
-        inspector.cloud_size_changed.connect(self._cloud_size_changed)
-        inspector.cloud_guides_changed.connect(self._cloud_guides_changed)
-        inspector.cloud_view_requested.connect(self._cloud_view_requested)
-        inspector.cloud_tool_requested.connect(self._cloud_tool_requested)
-        inspector.cloud_background_changed.connect(self._cloud_background_changed)
-        inspector.cloud_clip_changed.connect(self._cloud_clip_changed)
-        return inspector
+        return build_inspector(self)
 
     def _build_shortcuts(self) -> None:
         configurable = {
             "previous": self.previous_sample,
             "next": self.next_sample,
-            "accept": self.accept_current,
+            "first": self.first_sample,
+            "last": self.last_sample,
+            "playback": self.toggle_playback,
             "focus": self.toggle_focus,
             "reset": self.reset_views,
         }
@@ -619,22 +261,13 @@ class MainWindow(QMainWindow):
             self.action_shortcuts[action] = shortcut
 
         bindings = (
-            ("Home", self.first_sample),
-            ("End", self.last_sample),
-            ("Escape", self.exit_focus),
+            ("Escape", self.cancel_current_tool),
             ("Ctrl+B", self.toggle_sidebar),
             ("Ctrl+O", self.choose_project),
-            ("N", self.next_unreviewed),
-            ("Shift+N", lambda: self.next_with_review_status("rejected")),
-            ("Ctrl+Shift+N", self.next_with_defect),
             ("Ctrl+,", self.open_settings),
             ("Tab", self.toggle_chrome),
             ("F11", self.toggle_fullscreen),
             ("Ctrl+Shift+P", self.open_command_palette),
-            ("Ctrl+1", lambda: self.set_product_mode("view")),
-            ("Ctrl+2", lambda: self.set_product_mode("review")),
-            ("Space", self.toggle_playback),
-            ("X", lambda: self.set_review_status("rejected")),
         )
         for sequence, handler in bindings:
             shortcut = QShortcut(QKeySequence(sequence), self)
@@ -658,28 +291,135 @@ class MainWindow(QMainWindow):
         root: Path,
         manual_dirs: dict[str, Path] | None = None,
         force_order: bool = False,
+        *,
+        collection_root: Path | None = None,
+        project_roots: list[Path] | None = None,
     ) -> None:
+        if self._scan_in_progress:
+            # A drop or picker change arrived while the scan dialog was open.
+            self.status_text.setText("正在扫描项目，请稍候")
+            return
         self._stop_playback()
         previous_root = self.dataset.root if self.dataset is not None else None
-        root = root.expanduser().resolve()
-        self.current_root = root
-        if manual_dirs is None:
-            manual_dirs, force_order = self._saved_matching_for(root)
-        output_root = self._saved_output_for(root)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            dataset = self.scanner.scan(
-                root,
-                manual_dirs=manual_dirs,
-                force_order=force_order,
-                output_root=output_root,
-            )
-        except Exception as exc:
-            self.current_root = previous_root
-            QMessageBox.critical(self, "无法打开项目", str(exc))
+        previous_collection_root = self.project_collection_root
+        previous_project_roots = list(self.project_roots)
+        selected_root = root.expanduser().resolve()
+        if not selected_root.is_dir():
+            QMessageBox.critical(self, "无法打开项目", f"项目文件夹不存在：{selected_root}")
             return
+        discover = project_roots is None
+        if discover:
+            root = selected_root
+            collection_root = None
+            project_roots = [selected_root]
+        else:
+            root = selected_root
+            project_roots = [path.expanduser().resolve() for path in project_roots]
+            collection_root = (
+                collection_root.expanduser().resolve()
+                if collection_root is not None
+                else None
+            )
+        self.current_root = root
+        if manual_dirs is None and not discover:
+            manual_dirs, force_order = self._saved_matching_for(root)
+        worker = ProjectScanWorker(root, manual_dirs, force_order, discover=discover)
+        dialog = QProgressDialog("正在扫描项目…", "取消", 0, 0, self)
+        dialog.setWindowTitle("打开项目")
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setMinimumDuration(300)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumWidth(380)
+        result: dict[str, object] = {}
+
+        def on_progress(text: str, done: int, total: int) -> None:
+            dialog.setLabelText(text)
+            if total > 0:
+                dialog.setRange(0, total)
+                dialog.setValue(done)
+
+        def on_discovered(roots: object) -> None:
+            result["roots"] = list(roots) if isinstance(roots, (list, tuple)) else []
+
+        def on_finished(dataset: object) -> None:
+            result["dataset"] = dataset
+            dialog.accept()
+
+        def on_failed(error: str) -> None:
+            result["error"] = error
+            dialog.accept()
+
+        def on_cancelled() -> None:
+            result["cancelled"] = True
+            dialog.accept()
+
+        def on_cancel_clicked() -> None:
+            result["cancelled"] = True
+            worker.cancel()
+
+        worker.signals.progress.connect(on_progress)
+        if hasattr(worker.signals, "discovered"):
+            worker.signals.discovered.connect(on_discovered)
+        worker.signals.finished.connect(on_finished)
+        worker.signals.failed.connect(on_failed)
+        worker.signals.cancelled.connect(on_cancelled)
+        dialog.canceled.connect(on_cancel_clicked)
+        self._scan_in_progress = True
+        self.setAcceptDrops(False)
+        try:
+            SCAN_POOL.start(worker)
+            dialog.exec()
         finally:
-            QApplication.restoreOverrideCursor()
+            self._scan_in_progress = False
+            self.setAcceptDrops(True)
+
+        if discover and result.get("roots"):
+            discovered_roots = [Path(str(item)).resolve() for item in result["roots"]]
+            if len(discovered_roots) > 1:
+                collection_root = selected_root
+                project_roots = discovered_roots
+                root = discovered_roots[0]
+            else:
+                project_roots = discovered_roots
+            self.current_root = root
+
+        if result.get("cancelled"):
+            self.current_root = previous_root
+            self.project_collection_root = previous_collection_root
+            self.project_roots = previous_project_roots
+            self._refresh_project_picker(previous_root)
+            return
+        if "error" in result:
+            self.current_root = previous_root
+            self.project_collection_root = previous_collection_root
+            self.project_roots = previous_project_roots
+            self._refresh_project_picker(previous_root)
+            QMessageBox.critical(self, "无法打开项目", str(result["error"]))
+            return
+        dataset = result.get("dataset")
+        if not isinstance(dataset, Dataset):
+            self.current_root = previous_root
+            self.project_collection_root = previous_collection_root
+            self.project_roots = previous_project_roots
+            self._refresh_project_picker(previous_root)
+            QMessageBox.critical(self, "无法打开项目", "扫描未返回有效结果")
+            return
+
+        if discover and manual_dirs is None:
+            # The background pass used automatic matching. Only projects with
+            # a saved manual mapping pay for a second, explicit scan.
+            saved_dirs, saved_force = self._saved_matching_for(root)
+            if saved_dirs or saved_force:
+                self.load_project(
+                    root,
+                    saved_dirs,
+                    saved_force,
+                    collection_root=collection_root,
+                    project_roots=project_roots,
+                )
+                return
+            manual_dirs, force_order = {}, False
 
         if not dataset.available_modalities:
             answer = QMessageBox.question(
@@ -693,39 +433,63 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(0, self.open_mapping_settings)
             else:
                 self.current_root = previous_root
+                self.project_collection_root = previous_collection_root
+                self.project_roots = previous_project_roots
+                self._refresh_project_picker(previous_root)
             return
 
         self.dataset = dataset
-        self.product_mode = self._saved_product_mode(dataset.root)
+        self.project_collection_root = collection_root
+        self.project_roots = project_roots
+        # Calibration files stored with the capture become selectable for this
+        # project only and are preferred when nothing was chosen before.
+        project_options = discover_project_calibrations(dataset.root)
+        self.calibration_options = [
+            option for option in self.calibration_options if not option.project_local
+        ] + project_options
         self.current_calibration_id, self.calibration = self._saved_calibration_selection(
             dataset.root
         )
+        auto_calibration = ""
+        if self.calibration is None and project_options:
+            try:
+                self.calibration = load_calibration(
+                    project_options[0].path, self._saved_rectify_mode(dataset.root)
+                )
+                self.current_calibration_id = project_options[0].id
+                auto_calibration = project_options[0].label
+            except (ValueError, OSError):
+                logger.exception("项目内标定无法加载：%s", project_options[0].path)
+        self._resolution_warnings: set[tuple[str, int, int]] = set()
+        self.rectify_mode = self._saved_rectify_mode(dataset.root)
+        if self.calibration is not None:
+            self.calibration = self.calibration.with_rectify_mode(self.rectify_mode)
         self.manual_dirs = dict(manual_dirs or {})
         self.force_order = force_order
         self.current_index = 0
         self.focused_modality = None
         self._cloud_clip_ranges = None
         self._rectified_cache.clear()
-        manifest_exists = (dataset.output_root / MANIFEST_FILENAME).is_file()
-        if self.product_mode == "review" or manifest_exists:
-            try:
-                self.review_store = ReviewStore(dataset)
-                self.accepted = self.review_store.reconcile()
-            except Exception as exc:
-                self.review_store = None
-                self.accepted = {
-                    sample.key
-                    for sample in dataset.samples
-                    if sample_is_copied(dataset, sample)
-                }
-                QMessageBox.warning(self, "审核文件不可用", str(exc))
-        else:
-            self.review_store = None
-            self.accepted = set()
-        self.settings.setValue("last_project", str(dataset.root))
+        self.settings.setValue(
+            "last_project",
+            str(self.project_collection_root or dataset.root),
+        )
         self._save_matching_for(dataset.root, self.manual_dirs, self.force_order)
-        self.setWindowTitle(f"{dataset.root.name} — Stereo Selector")
-        self.title_bar.set_context(dataset.root.name)
+        logger.info(
+            "已打开项目 %s：%d 组样本，%s",
+            dataset.root,
+            len(dataset.samples),
+            "、".join(dataset.available_modalities),
+        )
+        context = (
+            f"{self.project_collection_root.name} / {dataset.root.name}"
+            if self.project_collection_root is not None
+            else dataset.root.name
+        )
+        self.setWindowTitle(f"{context} — Stereo Selector")
+        self.title_bar.set_context(context)
+        self._remember_recent_project(self.project_collection_root or dataset.root)
+        self._refresh_project_picker(dataset.root)
         self.project_name_label.setText(dataset.root.name)
         self.project_path_label.setText(str(dataset.root))
         self.project_path_label.setToolTip(str(dataset.root))
@@ -735,21 +499,23 @@ class MainWindow(QMainWindow):
         incomplete_count = len(dataset.samples) - complete_count
         incomplete_text = f" · {incomplete_count} 组不完整" if incomplete_count else ""
         force_order_text = " · 强制顺序" if dataset.force_order else ""
+        project_text = ""
+        if len(self.project_roots) > 1:
+            project_index = self.project_roots.index(dataset.root) + 1
+            project_text = f"项目 {project_index}/{len(self.project_roots)} · "
         self.project_summary_label.setText(
-            f"{len(dataset.samples)} 组 · {len(dataset.available_modalities)} 种数据"
+            f"{project_text}{len(dataset.samples)} 组 · "
+            f"{len(dataset.available_modalities)} 种数据"
             f"{force_order_text}{incomplete_text}"
         )
         self.project_summary_label.show()
-        self.output_label.setText(str(dataset.output_root))
-        self.output_label.setToolTip(str(dataset.output_root))
         self.change_button.setText("更改项目")
         self.change_button.show()
         self.manual_mapping_button.show()
         self.modes_panel.hide()
         self.quality_panel.hide()
-        self.output_panel.hide()
         self.reset_button.show()
-        self.review_bar.show()
+        self.player_bar.show()
         self.topbar_button.setEnabled(True)
         if self._topbar_collapsed:
             self.inspection_bar.hide()
@@ -779,16 +545,86 @@ class MainWindow(QMainWindow):
         self.timeline.setEnabled(bool(dataset.samples))
         self.timeline_left.setText("1" if dataset.samples else "0")
         self.timeline_right.setText(str(len(dataset.samples)))
+        counter_width = max(28, self.timeline_right.fontMetrics().horizontalAdvance("0" * len(str(len(dataset.samples)))) + 8)
+        self.timeline_left.setFixedWidth(counter_width)
+        self.timeline_right.setFixedWidth(counter_width)
         self.inspector.set_sources(list(dataset.available_modalities), preferred[0] if preferred else "")
         self._inspector_source = preferred[0] if preferred else ""
         self.content_stack.setCurrentWidget(self.media_container)
         self._build_tile_pool()
         self._rebuild_tiles()
-        self.set_product_mode(self.product_mode, persist=False)
         self._refresh_activity_page()
-        self._update_review_stats()
         self._show_current()
-        self.status_text.setText(f"已打开 {dataset.root.name}")
+        if auto_calibration:
+            self.status_text.setText(f"已使用项目内标定 {auto_calibration}")
+        else:
+            self.status_text.setText(f"已打开 {dataset.root.name}")
+
+    def _remember_recent_project(self, root: Path) -> None:
+        recent = self._recent_projects()
+        entry = str(root)
+        recent = [entry, *[item for item in recent if item != entry]][:8]
+        self.settings.setValue("recent_projects", json.dumps(recent, ensure_ascii=False))
+        self._refresh_recent_projects()
+
+    def _recent_projects(self) -> list[str]:
+        raw = str(self.settings.value("recent_projects", "[]"))
+        try:
+            items = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        return [str(item) for item in items if isinstance(item, str)] if isinstance(items, list) else []
+
+    def _refresh_recent_projects(self) -> None:
+        if not hasattr(self, "empty_hint"):
+            return
+        existing = [item for item in self._recent_projects() if Path(item).is_dir()]
+        self.empty_hint.set_recent(existing)
+
+    def _open_recent_project(self, path: str) -> None:
+        target = Path(path)
+        if not target.is_dir():
+            self.status_text.setText("最近项目已不存在")
+            self._refresh_recent_projects()
+            return
+        self.load_project(target)
+
+    def _refresh_project_picker(self, selected_root: Path | None) -> None:
+        if not hasattr(self, "project_picker"):
+            return
+        self._project_picker_guard = True
+        try:
+            self.project_picker.clear()
+            for project_root in self.project_roots:
+                self.project_picker.addItem(project_root.name, str(project_root))
+            selected = str(selected_root) if selected_root is not None else ""
+            index = self.project_picker.findData(selected)
+            if index >= 0:
+                self.project_picker.setCurrentIndex(index)
+            multiple = len(self.project_roots) > 1
+            self.project_picker.setVisible(multiple)
+            self.project_picker.setEnabled(multiple)
+            if multiple and self.project_collection_root is not None:
+                self.project_picker.setToolTip(
+                    f"切换项目 · 共 {len(self.project_roots)} 个\n"
+                    f"{self.project_collection_root}"
+                )
+            else:
+                self.project_picker.setToolTip("")
+        finally:
+            self._project_picker_guard = False
+
+    def _project_picker_changed(self, index: int) -> None:
+        if self._project_picker_guard or not 0 <= index < len(self.project_roots):
+            return
+        selected = Path(str(self.project_picker.itemData(index))).resolve()
+        if self.dataset is not None and selected == self.dataset.root:
+            return
+        self.load_project(
+            selected,
+            collection_root=self.project_collection_root,
+            project_roots=self.project_roots,
+        )
 
     def _saved_matching_for(self, root: Path) -> tuple[dict[str, Path], bool]:
         prefix = self._matching_settings_prefix(root)
@@ -813,29 +649,6 @@ class MainWindow(QMainWindow):
         for name in MODALITY_INFO:
             self.settings.setValue(f"{prefix}/directories/{name}", str(directories.get(name, "")))
 
-    def _saved_output_for(self, root: Path) -> Path | None:
-        prefix = self._matching_settings_prefix(root)
-        value = str(self.settings.value(f"{prefix}/output_root", "")).strip()
-        if not value:
-            return None
-        candidate = Path(value).expanduser().resolve()
-        if candidate == root or candidate.is_relative_to(root):
-            return None
-        return candidate
-
-    def _save_output_for(self, root: Path, output_root: Path) -> None:
-        prefix = self._matching_settings_prefix(root)
-        self.settings.setValue(f"{prefix}/output_root", str(output_root))
-
-    def _saved_product_mode(self, root: Path) -> str:
-        prefix = self._matching_settings_prefix(root)
-        mode = str(self.settings.value(f"{prefix}/product_mode", "view"))
-        return mode if mode in {"view", "review"} else "view"
-
-    def _save_product_mode(self, root: Path, mode: str) -> None:
-        prefix = self._matching_settings_prefix(root)
-        self.settings.setValue(f"{prefix}/product_mode", mode)
-
     def _load_calibration_options(self) -> list[CalibrationOption]:
         options = builtin_calibration_options()
         raw = str(self.settings.value("calibration/custom_files", "[]"))
@@ -856,7 +669,7 @@ class MainWindow(QMainWindow):
         paths = [
             str(option.path)
             for option in self.calibration_options
-            if not option.builtin and option.path.is_file()
+            if not option.builtin and not option.project_local and option.path.is_file()
         ]
         self.settings.setValue(
             "calibration/custom_files",
@@ -897,8 +710,9 @@ class MainWindow(QMainWindow):
         if option is None:
             return "", None
         try:
-            return option.id, load_calibration(option.path)
+            return option.id, load_calibration(option.path, self._saved_rectify_mode(root))
         except (ValueError, OSError):
+            logger.exception("已保存的标定无法加载：%s", option.path)
             return "", None
 
     def _save_calibration_selection(
@@ -925,10 +739,57 @@ class MainWindow(QMainWindow):
         self.calibration_picker.blockSignals(False)
         if self.calibration is not None:
             self.calibration_picker.setToolTip(
-                f"{self.calibration.summary}\n{self.calibration.source}"
+                f"{self.calibration.details}\n{self.calibration.source}"
             )
         else:
             self.calibration_picker.setToolTip("选择标定预设")
+        self._refresh_rectify_mode_picker()
+
+    def _refresh_rectify_mode_picker(self) -> None:
+        """Show the air/underwater switch only when the calibration carries both sets."""
+        if not hasattr(self, "rectify_mode_picker"):
+            return
+        modes = self.calibration.available_rectify_modes if self.calibration is not None else []
+        selectable = len(modes) > 1
+        self.rectify_mode_picker.setVisible(selectable)
+        self.rectify_mode_picker.setEnabled(selectable)
+        if self.calibration is not None:
+            self.rectify_mode_picker.blockSignals(True)
+            self.rectify_mode_picker.setCurrentIndex(
+                max(0, self.rectify_mode_picker.findData(self.calibration.rectify_mode))
+            )
+            self.rectify_mode_picker.blockSignals(False)
+            self.rectify_mode_picker.setToolTip(
+                "校正模式：水下相机在空气和水中使用不同的校正参数，按项目记忆"
+            )
+
+    def _saved_rectify_mode(self, root: Path) -> str:
+        prefix = self._matching_settings_prefix(root)
+        return normalize_rectify_mode(self.settings.value(f"{prefix}/rectify_mode", "air"))
+
+    def _rectify_mode_changed(self) -> None:
+        mode = normalize_rectify_mode(self.rectify_mode_picker.currentData())
+        if mode == self.rectify_mode:
+            return
+        self.rectify_mode = mode
+        if self.dataset is not None:
+            prefix = self._matching_settings_prefix(self.dataset.root)
+            self.settings.setValue(f"{prefix}/rectify_mode", mode)
+        if self.calibration is None or mode not in self.calibration.available_rectify_modes:
+            return
+        self.calibration = self.calibration.with_rectify_mode(mode)
+        self._invalidate_rectification()
+        self._rectified_cache.clear()
+        self._refresh_calibration_picker(self.current_calibration_id)
+        if self.dataset is not None:
+            # Cloud projection intrinsics come from the rectified frame.
+            self.focused_modality = None
+            self._build_tile_pool()
+            self._rebuild_tiles()
+            self._show_current()
+        label = dict(RECTIFY_MODE_CHOICES).get(mode, mode)
+        logger.info("校正模式切换为 %s（%s）", label, self.current_calibration_id)
+        self.status_text.setText(f"校正模式：{label}")
 
     def _apply_calibration_selection(
         self,
@@ -938,11 +799,14 @@ class MainWindow(QMainWindow):
     ) -> bool:
         option = self._calibration_option(option_id)
         try:
-            calibration = load_calibration(option.path) if option is not None else None
+            calibration = load_calibration(option.path, self.rectify_mode) if option is not None else None
         except Exception as exc:
+            logger.exception("加载标定失败：%s", option.path if option is not None else "")
             QMessageBox.critical(self, "无法加载标定", str(exc))
             self._refresh_calibration_picker(self.current_calibration_id)
             return False
+        self._invalidate_rectification()
+        self._rectified_cache.clear()
         self.current_calibration_id = option.id if option is not None else ""
         self.calibration = calibration
         if self.dataset is not None:
@@ -991,39 +855,6 @@ class MainWindow(QMainWindow):
             return
         self.load_project(root, dialog.selected_dirs(), dialog.force_order)
 
-    def _mode_picker_changed(self, _index: int) -> None:
-        self.set_product_mode(str(self.mode_picker.currentData() or "view"))
-
-    def set_product_mode(self, mode: str, *, persist: bool = True) -> None:
-        mode = mode if mode in {"view", "review"} else "view"
-        entering_review = mode == "review" and self.product_mode != "review"
-        self.product_mode = mode
-        picker_index = self.mode_picker.findData(mode)
-        if picker_index >= 0 and self.mode_picker.currentIndex() != picker_index:
-            self.mode_picker.blockSignals(True)
-            self.mode_picker.setCurrentIndex(picker_index)
-            self.mode_picker.blockSignals(False)
-        review_mode = mode == "review"
-        self.review_controls.setVisible(review_mode and self.dataset is not None)
-        self.activity_buttons["review"].setVisible(review_mode)
-        if not review_mode and self._active_sidebar_page == "review":
-            self._active_sidebar_page = "data"
-        accept_shortcut = self.action_shortcuts.get("accept")
-        if accept_shortcut is not None:
-            accept_shortcut.setEnabled(review_mode)
-        if entering_review and self.dataset is not None and self.review_store is None:
-            try:
-                self.review_store = ReviewStore(self.dataset)
-                self.accepted = self.review_store.reconcile()
-            except Exception as exc:
-                QMessageBox.warning(self, "审核文件不可用", str(exc))
-        if persist and self.dataset is not None:
-            self._save_product_mode(self.dataset.root, mode)
-        self._refresh_activity_page()
-        if self.dataset is not None:
-            self._show_current()
-        self.status_text.setText("筛选模式" if review_mode else "查看模式")
-
     def _layout_picker_changed(self, _index: int) -> None:
         try:
             self._layout_columns = int(self.layout_picker.currentData() or 0)
@@ -1033,14 +864,29 @@ class MainWindow(QMainWindow):
         self._apply_tile_layout()
 
     def _select_activity(self, page: str) -> None:
-        if page == "review" and self.product_mode != "review":
+        if not self._activity_available(page):
+            self._refresh_activity_page()
             return
-        if page == "analysis":
-            if not self.inspector.isVisible():
-                self.open_inspector()
-            else:
+        self._reset_interaction_tools()
+        if page in {"adjust", "measure", "statistics"}:
+            same_open_page = (
+                self.inspector.isVisible()
+                and self._active_sidebar_page == page
+                and self.inspector.category == page
+            )
+            self._active_sidebar_page = page
+            if not self._sidebar_collapsed:
+                self.toggle_sidebar()
+            if same_open_page:
                 self.close_inspector()
+            else:
+                self.inspector.set_category(page)
+                self.open_inspector()
+                self._update_inspector()
+                self._refresh_activity_page()
             return
+        if self.inspector.isVisible():
+            self.close_inspector()
         if not self._sidebar_collapsed and page == self._active_sidebar_page:
             self.toggle_sidebar()
             return
@@ -1063,16 +909,14 @@ class MainWindow(QMainWindow):
             and self.dataset is not None
             and "depth_fsd" in self.dataset.available_modalities
         )
-        self.output_panel.setVisible(
-            visible
-            and page == "review"
-            and self.dataset is not None
-            and self.product_mode == "review"
-        )
         for name, button in self.activity_buttons.items():
             button.setChecked(
                 (name == page and visible)
-                or (name == "analysis" and self.inspector.isVisible())
+                or (
+                    name in {"adjust", "measure", "statistics"}
+                    and name == page
+                    and self.inspector.isVisible()
+                )
             )
 
     def selected_modalities(self) -> list[str]:
@@ -1104,8 +948,10 @@ class MainWindow(QMainWindow):
         self.tile_pool.clear()
         if self.dataset is None:
             return
+        # Device point clouds and depth maps share the rectified left frame,
+        # so the cloud projector uses the depth camera model when available.
         left_calibration = (
-            self.calibration.left
+            self.calibration.depth_camera()
             if self.calibration is not None
             else None
         )
@@ -1126,6 +972,7 @@ class MainWindow(QMainWindow):
                 cloud_z_max=self.preferences.cloud_z_max,
                 cloud_tau_rel=self.preferences.cloud_tau_rel,
                 cloud_occlusion=self.preferences.cloud_occlusion,
+                canvas_background=PALETTES[self.preferences.theme]["media_workspace"],
                 parent=self.media_container,
                 cloud_intrinsics=(
                     left_calibration.matrix
@@ -1139,7 +986,7 @@ class MainWindow(QMainWindow):
                     else None
                 ),
                 cloud_translation=(
-                    self.calibration.cloud_translation
+                    self.calibration.cloud_translation_m
                     if self.calibration is not None
                     else None
                 ),
@@ -1152,6 +999,7 @@ class MainWindow(QMainWindow):
             tile.selection_changed.connect(self._media_selection_changed)
             tile.pixel_clicked.connect(self._image_pixel_clicked)
             if tile.cloud_canvas is not None:
+                tile.cloud_canvas.tool_finished.connect(self._reset_interaction_tools)
                 tile.cloud_canvas.point_picked.connect(self._point_cloud_picked)
                 tile.cloud_canvas.measurement_changed.connect(
                     self._point_cloud_measurement
@@ -1166,23 +1014,30 @@ class MainWindow(QMainWindow):
             self.tile_pool[modality] = tile
 
     def _rebuild_tiles(self) -> None:
-        self._clear_grid()
+        self._reset_interaction_tools()
         selected_names = set(self.selected_modalities())
         for name, tile in self.tile_pool.items():
-            tile.hide()
-            tile.set_focused(False)
             if name not in selected_names:
+                self.media_grid.removeWidget(tile)
+                tile.hide()
                 tile.cancel_pending()
         self.tiles = {
             modality: self.tile_pool[modality]
             for modality in MODALITY_INFO
-            if modality in selected_names
-            if modality in self.tile_pool
+            if modality in selected_names and modality in self.tile_pool
         }
         self._apply_tile_layout()
         self.selected_count_label.setText(f"已选 {len(self.tiles)}")
+        self._update_inspector()
 
     def _apply_tile_layout(self) -> None:
+        self.media_container.setUpdatesEnabled(False)
+        try:
+            self._place_tiles()
+        finally:
+            self.media_container.setUpdatesEnabled(True)
+
+    def _place_tiles(self) -> None:
         while self.media_grid.count():
             self.media_grid.takeAt(0)
         for row in range(5):
@@ -1240,9 +1095,18 @@ class MainWindow(QMainWindow):
     def _toggle_crosshair(self, checked: bool) -> None:
         for tile in self.tile_pool.values():
             tile.image_canvas.set_crosshair_mode(checked)
+        target_height = (
+            INSPECTION_BAR_CURSOR_HEIGHT if checked else INSPECTION_BAR_HEIGHT
+        )
+        self.cursor_info_row.setVisible(checked)
+        self._topbar_expanded_height = target_height
+        if not self._topbar_collapsed and self.inspection_bar.isVisible():
+            self.inspection_bar.setFixedHeight(target_height)
         if checked:
             self.cursor_info.setText("在图片上移动鼠标")
             return
+        self._cursor_update_timer.stop()
+        self._pending_cursor_update = None
         self._crosshair_position = None
         self.cursor_info.clear()
         for tile in self.tile_pool.values():
@@ -1276,11 +1140,19 @@ class MainWindow(QMainWindow):
             self.status_text.setText("正在生成校正视图…")
             QTimer.singleShot(0, self._apply_rectified_views)
             return
+        self._invalidate_rectification()
         for modality in ("left", "right"):
             tile = self.tile_pool.get(modality)
             if tile is not None and tile.image_data is not None:
                 tile.set_display_settings()
         self.status_text.setText("已显示校正前图像")
+
+    def _invalidate_rectification(self) -> None:
+        """Make every outstanding rectification callback stale."""
+        self._rectify_sequence += 1
+        self._rectify_token = None
+        self._rectify_key = None
+        self._rectify_worker = None
 
     def _apply_rectified_views(self) -> None:
         if not self.rectify_button.isChecked() or self.calibration is None:
@@ -1292,59 +1164,130 @@ class MainWindow(QMainWindow):
             or right is None
             or left.image_data is None
             or right.image_data is None
-            or left._current_path is None
-            or right._current_path is None
+            or left.current_path is None
+            or right.current_path is None
         ):
             return
         key = (
-            str(left._current_path),
-            str(right._current_path),
+            str(left.current_path),
+            str(right.current_path),
             self.current_calibration_id,
         )
-        images = self._rectified_cache.get(key)
-        if images is None:
-            try:
-                images = rectify_stereo_images(
-                    left.image_data.image,
-                    right.image_data.image,
-                    self.calibration,
+        cached = self._rectified_cache.get(key)
+        if cached is None:
+            if self._rectify_token is not None:
+                if self._rectify_key == key:
+                    return
+                self._invalidate_rectification()
+            self._rectify_sequence += 1
+            token = self._rectify_sequence
+            self._rectify_token = token
+            self._rectify_key = key
+            self.status_text.setText("正在生成校正视图…")
+            worker = RectifyWorker(
+                token,
+                left.image_data.image,
+                right.image_data.image,
+                self.calibration,
+            )
+            self._rectify_worker = worker
+
+            def on_finished(result_token: int, images: object) -> None:
+                if result_token != token or self._rectify_token != token:
+                    return
+                self._rectify_worker = None
+                self._rectify_token = None
+                self._rectify_key = None
+                if not isinstance(images, tuple) or len(images) < 2:
+                    return
+                method = str(images[2]) if len(images) > 2 else ""
+                images = (images[0], images[1])
+                self._rectified_cache[key] = (images, method)
+                if len(self._rectified_cache) > 6:
+                    self._rectified_cache.pop(next(iter(self._rectified_cache)))
+                current_key = (
+                    str(left.current_path),
+                    str(right.current_path),
+                    self.current_calibration_id,
                 )
-            except Exception as exc:
+                if current_key != key or not self.rectify_button.isChecked():
+                    if self.rectify_button.isChecked():
+                        QTimer.singleShot(0, self._apply_rectified_views)
+                    return
+                left.image_canvas.set_image(images[0], preserve_view=True)
+                right.image_canvas.set_image(images[1], preserve_view=True)
+                self.status_text.setText(f"已显示校正后图像 · {method}" if method else "已显示校正后图像")
+
+            def on_failed(result_token: int, error: str) -> None:
+                if result_token != token or self._rectify_token != token:
+                    return
+                self._rectify_worker = None
+                self._rectify_token = None
+                self._rectify_key = None
                 self.rectify_button.blockSignals(True)
                 self.rectify_button.setChecked(False)
                 self.rectify_button.blockSignals(False)
-                self.status_text.setText(f"无法生成校正视图：{exc}")
-                return
-            self._rectified_cache[key] = images
-            if len(self._rectified_cache) > 6:
-                self._rectified_cache.pop(next(iter(self._rectified_cache)))
+                self.status_text.setText(f"无法生成校正视图：{error}")
+
+            worker.signals.finished.connect(on_finished)
+            worker.signals.failed.connect(on_failed)
+            IMAGE_POOL.start(worker)
+            return
+        if self._rectify_token is not None and self._rectify_key != key:
+            self._invalidate_rectification()
+        images, method = cached
         left.image_canvas.set_image(images[0], preserve_view=True)
         right.image_canvas.set_image(images[1], preserve_view=True)
-        self.status_text.setText("已显示校正后图像")
+        self.status_text.setText(f"已显示校正后图像 · {method}" if method else "已显示校正后图像")
 
     def _media_cursor_moved(self, modality: str, x: float, y: float) -> None:
         if not self.crosshair_button.isChecked():
             return
+        self._pending_cursor_update = (modality, x, y)
+        if not self._cursor_update_timer.isActive():
+            self._flush_cursor_update()
+            self._cursor_update_timer.start()
+
+    def _drain_cursor_update(self) -> None:
+        if self._pending_cursor_update is None:
+            return
+        self._flush_cursor_update()
+        self._cursor_update_timer.start()
+
+    def _flush_cursor_update(self) -> None:
+        pending = self._pending_cursor_update
+        self._pending_cursor_update = None
+        if pending is None or not self.crosshair_button.isChecked():
+            return
+        modality, x, y = pending
         self._crosshair_position = (x, y)
         for tile in self.tiles.values():
             if tile.image_data is not None:
                 tile.image_canvas.set_crosshair(x, y, True)
                 tile.image_canvas.set_epiline(None)
-        self.cursor_info.setText(self._cursor_value_text(modality, x, y))
+        self.cursor_info.set_values(**self._cursor_value_fields(modality, x, y))
         if self.epiline_button.isChecked():
             self._update_epiline(modality, x, y)
 
     def _media_cursor_left(self, modality: str) -> None:
         if not self.crosshair_button.isChecked():
             return
+        self._cursor_update_timer.stop()
+        self._pending_cursor_update = None
         self._crosshair_position = None
         for tile in self.tile_pool.values():
             tile.image_canvas.set_crosshair(0, 0, False)
             tile.image_canvas.set_epiline(None)
         self.cursor_info.setText("在图片上移动鼠标")
 
-    def _cursor_value_text(self, source: str, x: float, y: float) -> str:
-        parts: list[str] = []
+    def _cursor_value_fields(self, source: str, x: float, y: float) -> dict[str, str]:
+        fields = {
+            "position": "",
+            "rgb": "",
+            "stereo": "",
+            "depth": "",
+            "xyz": "",
+        }
         left = self.tile_pool.get("left")
         right = self.tile_pool.get("right")
         source_tile = self.tile_pool.get(source)
@@ -1364,19 +1307,21 @@ class MainWindow(QMainWindow):
             px = min(image.width() - 1, max(0, int(x * image.width())))
             py = min(image.height() - 1, max(0, int(y * image.height())))
             color = image.pixelColor(px, py)
-            parts.append(f"{modality_label(rgb_tile.modality)} ({px}, {py})")
-            parts.append(f"RGB {color.red()}, {color.green()}, {color.blue()}")
+            fields["position"] = f"{modality_label(rgb_tile.modality)} {px},{py}"
+            fields["rgb"] = f"RGB {color.red()},{color.green()},{color.blue()}"
         stereo_match = self._stereo_match_text(source, x, y)
         if stereo_match:
-            parts.append(stereo_match)
+            fields["stereo"] = stereo_match
 
         depth_value: float | None = None
+        depth_dtype = None
         depth = self.tile_pool.get("depth_fsd")
         if (
             depth is not None
             and depth.image_data is not None
         ):
             values = depth.image_data.values
+            depth_dtype = values.dtype
             height, width = values.shape[:2]
             px = min(width - 1, max(0, int(x * width)))
             py = min(height - 1, max(0, int(y * height)))
@@ -1388,39 +1333,42 @@ class MainWindow(QMainWindow):
             except (TypeError, ValueError):
                 depth_value = None
             if depth_value is not None and math.isfinite(depth_value):
-                parts.append(f"深度 {depth_value:g}")
+                if depth_is_valid(depth_value, depth_dtype):
+                    fields["depth"] = f"深度 {format_depth(depth_value, depth_dtype, self.preferences.depth_unit)}"
+                else:
+                    fields["depth"] = f"深度 {depth_value:g} 饱和" if depth_value >= 65535 else "深度 0 空洞"
+                    depth_value = None
             else:
                 depth_value = None
-                parts.append("深度 无效")
+                fields["depth"] = "深度 无效"
 
-        if (
-            depth_value is not None
-            and depth_value > 0
-            and self.calibration is not None
-            and self.calibration.left is not None
-        ):
-            left_calibration = self.calibration.left
+        camera = self.calibration.depth_camera() if self.calibration is not None else None
+        if depth_value is not None and camera is not None:
             width = (
-                left.image_data.image.width()
-                if left is not None and left.image_data is not None
-                else left_calibration.width
-                if left_calibration.width is not None
+                camera.width
+                if camera.width is not None
                 else depth.image_data.image.width()
             )
             height = (
-                left.image_data.image.height()
-                if left is not None and left.image_data is not None
-                else left_calibration.height
-                if left_calibration.height is not None
+                camera.height
+                if camera.height is not None
                 else depth.image_data.image.height()
             )
             px = x * width
             py = y * height
-            point = self.calibration.left.point_from_depth(px, py, depth_value)
-            parts.append(f"XYZ {point[0]:.3g}, {point[1]:.3g}, {point[2]:.3g}")
-        elif depth_value is not None and depth_value > 0:
-            parts.append("XYZ 需左目内参")
-        return "   ·   ".join(parts) or "无像素数据"
+            meters = depth_to_meters(depth_value, depth_dtype, self.preferences.depth_unit)
+            point = camera.point_from_depth(px, py, meters)
+            fields["xyz"] = f"XYZ {point[0]:.3f},{point[1]:.3f},{point[2]:.3f} m"
+        elif depth_value is not None:
+            fields["xyz"] = "XYZ 需左目内参"
+        if not any(fields.values()):
+            fields["position"] = "无像素数据"
+        return fields
+
+    def _cursor_value_text(self, source: str, x: float, y: float) -> str:
+        """Return the complete readout for tooltips and compatibility tests."""
+        fields = self._cursor_value_fields(source, x, y)
+        return "   ·   ".join(value for value in fields.values() if value)
 
     def _stereo_match_text(self, source: str, x: float, y: float) -> str:
         if source not in {"left", "right"}:
@@ -1435,18 +1383,12 @@ class MainWindow(QMainWindow):
         ):
             return ""
 
-        def gray(values: np.ndarray) -> np.ndarray:
-            array = np.asarray(values)
-            if array.ndim == 3:
-                array = array[..., :3].astype(np.float32, copy=False).mean(axis=2)
-            return array.astype(np.float32, copy=False)
-
         source_tile = left if source == "left" else right
         target_tile = right if source == "left" else left
-        source_gray = gray(source_tile.image_data.values)
-        target_gray = gray(target_tile.image_data.values)
-        source_height, source_width = source_gray.shape[:2]
-        target_height, target_width = target_gray.shape[:2]
+        source_values = np.asarray(source_tile.image_data.values)
+        target_values = np.asarray(target_tile.image_data.values)
+        source_height, source_width = source_values.shape[:2]
+        target_height, target_width = target_values.shape[:2]
         sx = max(0, min(source_width - 1, int(x * source_width)))
         sy = max(0, min(source_height - 1, int(y * source_height)))
         ty = max(0, min(target_height - 1, int(y * target_height)))
@@ -1461,14 +1403,28 @@ class MainWindow(QMainWindow):
             or target_width < radius * 2 + 1
         ):
             return ""
-        source_patch = source_gray[
+        source_patch = source_values[
             sy - radius : sy + radius + 1,
             sx - radius : sx + radius + 1,
         ]
-        target_strip = target_gray[
+        target_strip = target_values[
             ty - radius : ty + radius + 1,
             :,
         ]
+        # Convert only the 7×7 patch and seven-row search strip. Converting the
+        # entire pair on every pointer event made crosshair movement stutter.
+        if source_patch.ndim == 3:
+            source_patch = source_patch[..., :3].astype(
+                np.float32, copy=False
+            ).mean(axis=2)
+        else:
+            source_patch = source_patch.astype(np.float32, copy=False)
+        if target_strip.ndim == 3:
+            target_strip = target_strip[..., :3].astype(
+                np.float32, copy=False
+            ).mean(axis=2)
+        else:
+            target_strip = target_strip.astype(np.float32, copy=False)
         try:
             candidates = np.lib.stride_tricks.sliding_window_view(
                 target_strip,
@@ -1495,7 +1451,7 @@ class MainWindow(QMainWindow):
             else target_x - source_in_target_pixels
         )
         label = "R" if source == "left" else "L"
-        return f"{label} ({target_x}, {ty}) · 视差 {disparity:.2f}px"
+        return f"{label} {target_x},{ty} · 视差 {disparity:.2f}px"
 
     def _update_epiline(self, source: str, x: float, y: float) -> None:
         if source not in {"left", "right"}:
@@ -1545,12 +1501,38 @@ class MainWindow(QMainWindow):
             self._update_depth_quality()
         elif modality == "ply" and self._cloud_clip_ranges is not None:
             self._apply_cloud_clip()
+        if modality == "left":
+            self._check_calibration_resolution()
         if modality in {"left", "right"} and self.rectify_button.isChecked():
             QTimer.singleShot(0, self._apply_rectified_views)
         QTimer.singleShot(0, lambda name=modality: self._prefetch_adjacent_media(name))
         if modality == self._inspector_source:
             self._update_inspector()
         self._update_inspection_controls()
+
+    def _check_calibration_resolution(self) -> None:
+        """Warn once when the calibration was made for a different sensor size."""
+        if self.calibration is None or self.calibration.left is None:
+            return
+        left = self.tile_pool.get("left")
+        if left is None or left.image_data is None:
+            return
+        expected = (self.calibration.left.width, self.calibration.left.height)
+        if expected[0] is None or expected[1] is None:
+            return
+        actual = (left.image_data.image.width(), left.image_data.image.height())
+        if actual == expected:
+            return
+        key = (self.current_calibration_id, *actual)
+        if key in self._resolution_warnings:
+            return
+        self._resolution_warnings.add(key)
+        message = f"标定分辨率 {expected[0]}×{expected[1]} 与图像 {actual[0]}×{actual[1]} 不一致"
+        logger.warning("%s（%s）", message, self.current_calibration_id)
+        self.status_text.setText(message)
+        self.calibration_picker.setToolTip(
+            f"{self.calibration.details}\n{self.calibration.source}\n⚠ {message}"
+        )
 
     def _prefetch_adjacent_media(self, modality: str) -> None:
         if self.dataset is None or modality not in self.tiles:
@@ -1578,8 +1560,10 @@ class MainWindow(QMainWindow):
                 "正在计算…" if tile is not None and tile.image_data is not None else "等待深度图"
             )
             return
+        dtype = tile.image_data.values.dtype if tile is not None and tile.image_data is not None else None
+        unit = resolve_depth_unit(dtype, self.preferences.depth_unit)
         value_range = (
-            f"{stats.minimum:g} – {stats.maximum:g}"
+            f"{stats.minimum:g} – {stats.maximum:g} {unit}"
             if stats.minimum is not None and stats.maximum is not None
             else "无有效值"
         )
@@ -1617,8 +1601,15 @@ class MainWindow(QMainWindow):
         )
 
     def open_inspector(self) -> None:
+        if not self._inspection_sources():
+            return
         if self.inspector.isVisible():
             return
+        if self._active_sidebar_page not in {"adjust", "measure", "statistics"}:
+            self._active_sidebar_page = "statistics"
+            self.inspector.set_category("statistics")
+        if not self._sidebar_collapsed:
+            self.toggle_sidebar()
         self.inspector.show()
         width = max(290, min(340, self.inspector.sizeHint().width()))
         total = max(1, self.splitter.width())
@@ -1628,30 +1619,53 @@ class MainWindow(QMainWindow):
         self._update_inspector()
 
     def close_inspector(self) -> None:
+        self._reset_interaction_tools()
         self.inspector.hide()
         total = max(1, self.splitter.width())
         self.splitter.setSizes([self.sidebar.width(), total - self.sidebar.width(), 0])
         self._refresh_activity_page()
 
     def _inspector_source_changed(self, modality: str) -> None:
+        self._reset_interaction_tools()
         self._inspector_source = modality
         self._update_inspector()
+
+    def _inspection_sources(self) -> list[str]:
+        if self.dataset is None or not self.dataset.samples:
+            return []
+        sample = self.dataset.samples[self.current_index]
+        return [name for name in self.tiles if name in sample.files]
+
+    def _activity_available(self, page: str) -> bool:
+        if page == "data":
+            return True
+        if page == "display":
+            return self.dataset is not None and bool(self.dataset.available_modalities)
+        return page in {"adjust", "measure", "statistics"} and bool(self._inspection_sources())
 
     def _update_inspector(self) -> None:
         if not self.inspector.isVisible() or self.dataset is None:
             return
-        source = self._inspector_source
-        if source not in self.tile_pool:
-            source = next(iter(self.tiles), next(iter(self.tile_pool), ""))
-            self._inspector_source = source
+        sources = self._inspection_sources()
+        if not sources:
+            self.close_inspector()
+            return
+        source = self._inspector_source if self._inspector_source in sources else sources[0]
+        self._inspector_source = source
+        self.inspector.set_sources(sources, source)
         tile = self.tile_pool.get(source)
         if tile is None:
             return
-        path = tile._current_path
+        path = tile.current_path
         if source == "ply":
-            cloud = tile.cloud_canvas._cloud if tile.cloud_canvas is not None else None
+            cloud = tile.cloud_canvas.current_cloud if tile.cloud_canvas is not None and not tile.is_loading() and tile.showing_canvas() else None
+            self.inspector.set_ready(cloud is not None and bool(len(cloud.points)))
             self.inspector.set_cloud_data(cloud, path)
+            if cloud is not None and tile.cloud_canvas is not None:
+                self.inspector.set_cloud_controls(tile.cloud_canvas, self._cloud_clip_ranges)
         else:
+            self.inspector.set_ready(tile.image_data is not None and not tile.is_loading())
+            self.inspector.set_display_controls(tile.display_settings)
             self.inspector.set_image_data(source, tile.image_data, path)
 
     def _apply_display_settings(self, settings: object) -> None:
@@ -1663,7 +1677,7 @@ class MainWindow(QMainWindow):
         tile.set_display_settings(**settings)
 
     def _active_image_tile(self) -> MediaTile | None:
-        tile = self.tile_pool.get(self._inspector_source)
+        tile = self.tiles.get(self._inspector_source)
         if tile is not None and tile.image_data is not None:
             return tile
         return next(
@@ -1675,25 +1689,49 @@ class MainWindow(QMainWindow):
         tile = self._active_image_tile()
         if tile is None:
             return
-        if mode == "actual":
-            tile.image_canvas.show_actual_size()
-        elif mode == "width":
-            tile.image_canvas.fit_width()
-        else:
-            tile.image_canvas.reset_view()
+        tile.set_fit_mode(mode)
 
     def _tool_requested(self, tool: str) -> None:
         tile = self._active_image_tile()
         if tile is None:
             return
-        for candidate in self.tile_pool.values():
-            candidate.image_canvas.set_tool("pan")
+        previous = tile.image_canvas.tool
+        self._reset_interaction_tools()
+        if previous == tool:
+            tool = "pan"
         tile.image_canvas.set_tool(tool)
+        self.inspector.image_tool_buttons[tool].setChecked(True)
         self.status_text.setText(
             {"roi": "拖动选择矩形 ROI", "line": "拖动绘制测量线"}.get(tool, "")
         )
 
+    def _reset_interaction_tools(self, *, clear_selection: bool = False) -> None:
+        if clear_selection:
+            self.inspector.invalidate_roi()
+        for tile in self.tile_pool.values():
+            tile.image_canvas.set_tool("pan")
+            if clear_selection:
+                tile.image_canvas.clear_selection()
+            if tile.cloud_canvas is not None:
+                tile.cloud_canvas.set_interaction_mode("rotate")
+        self.inspector.reset_tools()
+
+    def cancel_current_tool(self) -> None:
+        from .ui_controls import ChoicePopup
+        for popup in self.findChildren(ChoicePopup):
+            if popup.isVisible():
+                popup.hide()
+                return
+        if self._settings_page is not None:
+            self._settings_page.reject()
+            return
+        self._reset_interaction_tools(clear_selection=True)
+        self.crosshair_button.setChecked(False)
+        self.status_text.clear()
+        self.exit_focus()
+
     def _media_selection_changed(self, modality: str, tool: str, selection: object) -> None:
+        self._reset_interaction_tools()
         tile = self.tile_pool.get(modality)
         if tile is None or tile.image_data is None:
             return
@@ -1711,32 +1749,48 @@ class MainWindow(QMainWindow):
         x1, y1, x2, y2 = map(float, selection)
         pixel_length = math.hypot((x2 - x1) * width, (y2 - y1) * height)
         physical: float | None = None
+        endpoint_depths: tuple[float, float] | None = None
+        note = ""
         depth_tile = self.tile_pool.get("depth_fsd")
-        if (
-            self.calibration is not None
-            and self.calibration.left is not None
-            and depth_tile is not None
-            and depth_tile.image_data is not None
-        ):
+        camera = self.calibration.depth_camera() if self.calibration is not None else None
+        if camera is not None and depth_tile is not None and depth_tile.image_data is not None:
             depth_values = depth_tile.image_data.values
             depth_height, depth_width = depth_values.shape[:2]
-            mx = max(0, min(depth_width - 1, int((x1 + x2) * 0.5 * depth_width)))
-            my = max(0, min(depth_height - 1, int((y1 + y2) * 0.5 * depth_height)))
-            raw = depth_values[my, mx]
-            if getattr(raw, "ndim", 0):
-                raw = raw.flat[0]
-            try:
-                depth = float(raw)
-            except (TypeError, ValueError):
-                depth = 0.0
-            if math.isfinite(depth) and 0 < depth < 65535:
-                camera = self.calibration.left
-                first = camera.point_from_depth(x1 * width, y1 * height, depth)
-                second = camera.point_from_depth(x2 * width, y2 * height, depth)
+            unit = self.preferences.depth_unit
+
+            def sample(nx: float, ny: float) -> float | None:
+                sx = max(0, min(depth_width - 1, int(nx * depth_width)))
+                sy = max(0, min(depth_height - 1, int(ny * depth_height)))
+                raw = depth_values[sy, sx]
+                if getattr(raw, "ndim", 0):
+                    raw = raw.flat[0]
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    return None
+                return value if depth_is_valid(value, depth_values.dtype) else None
+
+            first_depth = sample(x1, y1)
+            second_depth = sample(x2, y2)
+            if first_depth is not None and second_depth is not None:
+                frame_width = camera.width if camera.width is not None else width
+                frame_height = camera.height if camera.height is not None else height
+                first = camera.point_from_depth(
+                    x1 * frame_width, y1 * frame_height, depth_to_meters(first_depth, depth_values.dtype, unit)
+                )
+                second = camera.point_from_depth(
+                    x2 * frame_width, y2 * frame_height, depth_to_meters(second_depth, depth_values.dtype, unit)
+                )
                 physical = math.dist(first, second)
-                if depth > 100:
-                    physical /= 1000.0
-        self.inspector.set_line_measurement(pixel_length, physical)
+                endpoint_depths = (
+                    depth_to_meters(first_depth, depth_values.dtype, unit),
+                    depth_to_meters(second_depth, depth_values.dtype, unit),
+                )
+            else:
+                note = "端点深度无效，无法换算物理长度"
+        elif camera is None and depth_tile is not None and depth_tile.image_data is not None:
+            note = "需要标定才能换算物理长度"
+        self.inspector.set_line_measurement(pixel_length, physical, endpoint_depths, note)
 
     def _image_pixel_clicked(self, modality: str, x: float, y: float) -> None:
         cloud_tile = self.tile_pool.get("ply")
@@ -1753,7 +1807,7 @@ class MainWindow(QMainWindow):
         cloud_tile = self.tile_pool.get("ply")
         if cloud_tile is None or cloud_tile.cloud_canvas is None:
             return
-        cloud = cloud_tile.cloud_canvas._cloud
+        cloud = cloud_tile.cloud_canvas.current_cloud
         color = None
         if cloud is not None and len(cloud.points):
             index = int(np.argmin(np.sum((cloud.points - camera_point) ** 2, axis=1)))
@@ -1802,15 +1856,42 @@ class MainWindow(QMainWindow):
             return
         target = tile.cloud_canvas.view if tile.cloud_canvas is not None and tile.modality == "ply" else tile.image_canvas.viewport()
         if not target.grab().save(selected):
+            logger.error("导出视图失败：%s", selected)
             QMessageBox.warning(self, "导出失败", f"无法写入：\n{selected}")
             return
+        logger.info("已导出视图：%s", selected)
         self.status_text.setText(f"已导出 {Path(selected).name}")
 
-    def _stereo_action(self, action: str) -> None:
-        if action == "cloud_projection":
-            self.open_cloud_projection()
-        else:
-            self.open_stereo_overlay(mode=action)
+    def export_adjusted_image(self) -> None:
+        """Write the current display adjustments at the source resolution."""
+        tile = self.tile_pool.get(self._inspector_source)
+        if tile is None or tile.image_data is None:
+            tile = next((item for item in self.tiles.values() if item.image_data is not None), None)
+        if tile is None or tile.image_data is None:
+            self.status_text.setText("没有可导出的图片")
+            return
+        start = self.dataset.root if self.dataset is not None else Path.home()
+        stem = tile.current_path.stem if tile.current_path is not None else tile.modality
+        selected, _filter = QFileDialog.getSaveFileName(
+            self,
+            "导出调整后的原始分辨率图像",
+            str(start / f"{stem}_{tile.modality}_adjusted.png"),
+            "PNG 图片 (*.png);;TIFF 图片 (*.tif *.tiff)",
+        )
+        if not selected:
+            return
+        try:
+            image = render_image_values(tile.image_data.values, **tile.display_settings)
+        except Exception as exc:
+            logger.exception("渲染导出图像失败")
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        if not image.save(selected):
+            logger.error("导出图像失败：%s", selected)
+            QMessageBox.warning(self, "导出失败", f"无法写入：\n{selected}")
+            return
+        logger.info("已导出调整后图像：%s", selected)
+        self.status_text.setText(f"已导出 {Path(selected).name}")
 
     def _cloud_color_changed(self, mode: str) -> None:
         tile = self.tile_pool.get("ply")
@@ -1833,16 +1914,21 @@ class MainWindow(QMainWindow):
             tile.cloud_canvas.set_standard_view(view)
 
     def _cloud_tool_requested(self, tool: str) -> None:
-        tile = self.tile_pool.get("ply")
-        if tile is not None and tile.cloud_canvas is not None:
+        tile = self.tiles.get("ply")
+        if tile is not None and tile.cloud_canvas is not None and not tile.is_loading() and tile.showing_canvas():
+            previous = tile.cloud_canvas.interaction_mode
+            self._reset_interaction_tools()
             if tool == "reset":
-                if self._cloud_clip_ranges is not None:
-                    self._apply_cloud_clip()
-                else:
-                    count = tile.cloud_canvas.restore_full_cloud()
-                    self.status_text.setText(f"已恢复 {count:,} 个点")
+                self._cloud_clip_ranges = None
+                count = tile.cloud_canvas.restore_full_cloud()
+                self.inspector.reset_clip_bounds()
+                self._update_inspector()
+                self.status_text.setText(f"已恢复 {count:,} 个点")
                 return
+            if previous == tool:
+                tool = "rotate"
             tile.cloud_canvas.set_interaction_mode(tool)
+            self.inspector.cloud_tool_buttons[tool].setChecked(True)
             self.status_text.setText(
                 {
                     "pick": "点击点云查看 XYZ",
@@ -1887,7 +1973,7 @@ class MainWindow(QMainWindow):
         left = self.tile_pool.get("left")
         cloud_tile = self.tile_pool.get("ply")
         cloud = (
-            cloud_tile.cloud_canvas._cloud
+            cloud_tile.cloud_canvas.current_cloud
             if cloud_tile is not None and cloud_tile.cloud_canvas is not None
             else None
         )
@@ -1941,6 +2027,11 @@ class MainWindow(QMainWindow):
             return
         self.current_index = max(0, min(self.current_index, len(self.dataset.samples) - 1))
         sample = self.dataset.samples[self.current_index]
+        key = (self.dataset.root, sample.key)
+        if getattr(self, "_interaction_frame", None) != key:
+            self._interaction_frame = key
+            self._reset_interaction_tools(clear_selection=True)
+            self.inspector.selection_label.setText("未选择区域或测量点")
         if self.crosshair_button.isChecked():
             self._media_cursor_left("")
         depth_tile = self.tile_pool.get("depth_fsd")
@@ -1961,49 +2052,15 @@ class MainWindow(QMainWindow):
             and not self._playback_timer.isActive()
         ):
             depth_tile.show_file(depth_path)
+        if depth_tile is not None and depth_tile.depth_stats is not None:
+            self._update_depth_quality()
 
-        self.sample_title.setText(sample.display_name)
-        self.sample_meta.setText(
-            f"第 {self.current_index + 1} / {len(self.dataset.samples)} 组  ·  {len(sample.files)} 个文件"
-        )
-        record = self.review_store.get(sample) if self.review_store is not None else {}
-        review_state = (
-            "accepted"
-            if sample.key in self.accepted
-            else str(record.get("status", "pending"))
-        )
-        if review_state not in {"accepted", "rejected", "pending"}:
-            review_state = "pending"
-        is_accepted = review_state == "accepted"
-        self.sample_status.setText(
-            {"accepted": "已接受", "rejected": "已拒绝", "pending": "待定"}[review_state]
-        )
-        visual_state = review_state if self.product_mode == "review" else "view"
-        if self.review_bar.property("reviewState") != visual_state:
-            self.review_bar.setProperty("reviewState", visual_state)
-            for widget in (
-                self.review_bar,
-                self.sample_title,
-                self.accept_button,
-                self.reject_button,
-                self.sample_status,
-            ):
-                widget.style().unpolish(widget)
-                widget.style().polish(widget)
-        self.sample_status.setProperty("reviewStatus", review_state)
-        if bool(self.sample_status.property("accepted")) != is_accepted:
-            self.sample_status.setProperty("accepted", is_accepted)
-            self.sample_status.style().unpolish(self.sample_status)
-            self.sample_status.style().polish(self.sample_status)
-        accept_label = self.preferences.button_labels["accept"]
-        self.accept_button.setText("继续" if is_accepted else accept_label)
-        self._update_annotation_button(sample)
-        self.header_breadcrumb.setText(f"{self.dataset.root.name}  /  {sample.display_name}")
-        self.header_breadcrumb.setToolTip(str(self.dataset.root))
         self.timeline.blockSignals(True)
         self.timeline.setValue(self.current_index)
         self.timeline.blockSignals(False)
         self.timeline_left.setText(str(self.current_index + 1))
+        self.timeline_left.setToolTip(sample.display_name)
+        self.player_bar.setToolTip(f"{sample.display_name} · {len(sample.files)} 个文件")
 
         missing = summarize_missing(sample, self.selected_modalities())
         if missing:
@@ -2012,85 +2069,17 @@ class MainWindow(QMainWindow):
         else:
             self.status_text.setText("")
         self._update_controls()
+        self._update_inspector()
 
     def _timeline_changed(self, value: int) -> None:
-        if self.dataset is not None and value != self.current_index:
-            self.current_index = value
-            self._show_current()
-
-    def _playback_speed_changed(self, index: int) -> None:
-        try:
-            fps = float(self.playback_speed.itemData(index))
-        except (TypeError, ValueError):
-            fps = 2.0
-        self._playback_fps = max(0.5, min(10.0, fps))
-        self._playback_timer.setInterval(max(40, round(1000 / self._playback_fps)))
-
-    def toggle_playback(self) -> None:
-        if self._playback_timer.isActive():
-            self._stop_playback()
-            return
-        if self.dataset is None or not self.dataset.samples:
-            return
-        if self.current_index >= len(self.dataset.samples) - 1:
-            self.current_index = 0
-            self._show_current()
-        for tile in self.tile_pool.values():
-            tile.set_analysis_enabled(False)
-        self._playback_timer.start()
-        self.playback_button.set_playing(True)
-        self.playback_button.setToolTip("暂停")
-        self.status_text.setText(f"正在播放 · {self._playback_fps:g} fps")
-
-    def _playback_tick(self) -> None:
-        if self.dataset is None or not self.dataset.samples:
-            self._stop_playback()
-            return
-        # Do not skip a frame while its visible media is still loading. This
-        # keeps point-cloud playback ordered even at a requested high speed.
-        if any(tile._active_worker_token is not None for tile in self.tiles.values()):
-            return
-        if self.current_index >= len(self.dataset.samples) - 1:
-            self._stop_playback()
-            return
-        self.current_index += 1
-        self._show_current()
-
-    def _stop_playback(self) -> None:
-        was_active = self._playback_timer.isActive()
-        self._playback_timer.stop()
-        if hasattr(self, "playback_button"):
-            self.playback_button.set_playing(False)
-            self.playback_button.setToolTip("播放")
-        for tile in self.tile_pool.values():
-            tile.set_analysis_enabled(True)
-        depth_tile = self.tile_pool.get("depth_fsd")
-        if was_active:
-            for tile in self.tiles.values():
-                if tile.image_data is not None:
-                    tile.refresh_analysis()
-        if was_active and depth_tile is not None and "depth_fsd" not in self.tiles:
-            current = (
-                self.dataset.samples[self.current_index].files.get("depth_fsd")
-                if self.dataset is not None and self.dataset.samples
-                else None
-            )
-            if depth_tile._current_path != current:
-                depth_tile.show_file(current)
-            else:
-                depth_tile.refresh_analysis()
-        if was_active and hasattr(self, "status_text"):
-            self.status_text.setText("")
+        self._seek_frame(value, pause=not self.timeline.isSliderDown())
 
     def _update_controls(self) -> None:
         has_samples = self.dataset is not None and bool(self.dataset.samples)
         count = len(self.dataset.samples) if self.dataset else 0
-        self.previous_button.setEnabled(bool(has_samples and self.current_index > 0))
-        self.next_button.setEnabled(bool(has_samples and self.current_index < count - 1))
-        review_enabled = bool(has_samples and self.product_mode == "review")
-        self.accept_button.setEnabled(review_enabled)
-        self.reject_button.setEnabled(review_enabled)
-        self.pending_button.setEnabled(review_enabled)
+        for page, button in self.activity_buttons.items():
+            button.setEnabled(self._activity_available(page))
+        self.manual_mapping_button.setEnabled(self.dataset is not None)
         self.reset_button.setEnabled(bool(has_samples))
         self.timeline.setEnabled(bool(has_samples))
         self.playback_previous_button.setEnabled(bool(has_samples and self.current_index > 0))
@@ -2099,131 +2088,7 @@ class MainWindow(QMainWindow):
         )
         self.playback_button.setEnabled(bool(has_samples and count > 1))
         self.playback_speed.setEnabled(bool(has_samples and count > 1))
-        self.open_output_button.setEnabled(self.dataset is not None)
-        self.configure_output_button.setEnabled(self.dataset is not None)
-        self.annotation_button.setEnabled(review_enabled)
         self._update_inspection_controls()
-
-    def _update_review_stats(self) -> None:
-        self._update_controls()
-
-    def previous_sample(self) -> None:
-        if self.dataset and self.current_index > 0:
-            self.current_index -= 1
-            self._show_current()
-
-    def next_sample(self) -> None:
-        if self.dataset and self.current_index < len(self.dataset.samples) - 1:
-            self.current_index += 1
-            self._show_current()
-
-    def first_sample(self) -> None:
-        if self.dataset and self.dataset.samples:
-            self.current_index = 0
-            self._show_current()
-
-    def last_sample(self) -> None:
-        if self.dataset and self.dataset.samples:
-            self.current_index = len(self.dataset.samples) - 1
-            self._show_current()
-
-    def next_unreviewed(self) -> None:
-        if self.product_mode != "review" or self.dataset is None or not self.dataset.samples:
-            return
-        self.next_with_review_status("pending")
-
-    def next_with_review_status(self, status: str) -> None:
-        if self.product_mode != "review" or self.dataset is None or not self.dataset.samples:
-            return
-        indices = list(range(self.current_index + 1, len(self.dataset.samples))) + list(range(0, self.current_index + 1))
-        for index in indices:
-            sample = self.dataset.samples[index]
-            sample_status = (
-                "accepted"
-                if sample.key in self.accepted
-                else str(
-                    self.review_store.get(sample).get("status", "pending")
-                    if self.review_store is not None
-                    else "pending"
-                )
-            )
-            if sample_status == status:
-                self.current_index = index
-                self._show_current()
-                return
-        self.status_text.setText(f"没有更多{status}样本")
-
-    def next_with_defect(self) -> None:
-        if (
-            self.product_mode != "review"
-            or self.dataset is None
-            or not self.dataset.samples
-            or self.review_store is None
-        ):
-            return
-        indices = list(range(self.current_index + 1, len(self.dataset.samples))) + list(
-            range(0, self.current_index + 1)
-        )
-        for index in indices:
-            record = self.review_store.get(self.dataset.samples[index])
-            if record.get("defect_tags"):
-                self.current_index = index
-                self._show_current()
-                return
-        self.status_text.setText("没有带缺陷标签的样本")
-
-    def accept_current(self) -> None:
-        if self.product_mode != "review":
-            return
-        self.set_review_status("accepted")
-
-    def set_review_status(self, status: str) -> None:
-        if (
-            self.product_mode != "review"
-            or status not in {"accepted", "rejected", "pending"}
-            or self.dataset is None
-            or not self.dataset.samples
-        ):
-            return
-        sample = self.dataset.samples[self.current_index]
-        copied_count = 0
-        if status == "accepted" and sample.key not in self.accepted:
-            try:
-                copied_count = len(copy_sample(self.dataset, sample))
-            except Exception as exc:
-                QMessageBox.critical(self, "复制失败", f"无法接受当前样本：\n{exc}")
-                return
-            self.accepted.add(sample.key)
-        elif status != "accepted":
-            self.accepted.discard(sample.key)
-        if self.review_store is None:
-            try:
-                self.review_store = ReviewStore(self.dataset)
-            except Exception as exc:
-                QMessageBox.warning(self, "审核记录不可用", str(exc))
-                return
-        try:
-            self.review_store.set_status(sample, status)
-        except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "审核记录未保存",
-                f"无法更新 JSON 审核文件：\n{exc}",
-            )
-        self._update_review_stats()
-        if (
-            self.preferences.auto_advance
-            and status in {"accepted", "rejected"}
-            and self.current_index < len(self.dataset.samples) - 1
-        ):
-            self.current_index += 1
-        self._show_current()
-        if copied_count:
-            self.status_text.setText(f"已接受 {sample.display_name}")
-        else:
-            self.status_text.setText(
-                {"accepted": "已接受", "rejected": "已拒绝", "pending": "已设为待定"}[status]
-            )
 
     def reset_views(self) -> None:
         for tile in self.tiles.values():
@@ -2231,96 +2096,70 @@ class MainWindow(QMainWindow):
         self.status_text.setText("视图已重置")
 
     def toggle_sidebar(self) -> None:
-        expanding = self._sidebar_collapsed
-        self._sidebar_collapsed = not expanding
+        # Avoid resizing all image/OpenGL viewports on every animation tick.
         if self._sidebar_animation is not None:
             self._sidebar_animation.stop()
-        panel = self.sidebar_panel
-        current_width = panel.width() if panel.isVisible() else 0
-        if expanding:
-            panel.show()
-            panel.setMinimumWidth(0)
-            panel.setMaximumWidth(max(0, current_width))
-            start, end = max(0, current_width), self._sidebar_expanded_width
-        else:
-            if current_width >= 220:
-                self._sidebar_expanded_width = min(360, current_width)
-            panel.setMinimumWidth(0)
-            panel.setMaximumWidth(max(0, current_width))
-            start, end = max(0, current_width), 0
-
-        animation = QPropertyAnimation(panel, b"maximumWidth", self)
-        animation.setDuration(190)
-        animation.setStartValue(start)
-        animation.setEndValue(end)
-        animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
-
-        def finish() -> None:
-            if expanding:
-                panel.setMinimumWidth(220)
-                panel.setMaximumWidth(360)
-            else:
-                panel.hide()
-                panel.setMaximumWidth(360)
+            self._sidebar_animation.deleteLater()
+            self._sidebar_animation = None
+        self.splitter.setUpdatesEnabled(False)
+        try:
+            expanding = self._sidebar_collapsed
+            if expanding and self._active_sidebar_page not in {"data", "display"}:
+                self._active_sidebar_page = "data"
+            if expanding and not self._activity_available(self._active_sidebar_page):
+                self._active_sidebar_page = "data"
+            if expanding and self.inspector.isVisible():
+                self.close_inspector()
+            if not expanding:
+                self._sidebar_expanded_width = min(
+                    SIDEBAR_MAX_WIDTH, max(SIDEBAR_MIN_WIDTH, self.sidebar.width())
+                )
+            self._sidebar_collapsed = not expanding
+            self.sidebar_panel.setVisible(expanding)
+            width = self._sidebar_expanded_width if expanding else ACTIVITY_BAR_WIDTH
+            self.sidebar.setMinimumWidth(SIDEBAR_MIN_WIDTH if expanding else ACTIVITY_BAR_WIDTH)
+            self.sidebar.setMaximumWidth(SIDEBAR_MAX_WIDTH if expanding else ACTIVITY_BAR_WIDTH)
+            self.sidebar_panel.setMinimumWidth(0)
+            self.sidebar_panel.setMaximumWidth(SIDEBAR_MAX_WIDTH - ACTIVITY_BAR_WIDTH)
+            sizes = self.splitter.sizes()
+            sizes[1] = max(1, sizes[1] + sizes[0] - width)
+            sizes[0] = width
+            self.splitter.setSizes(sizes)
             self._refresh_activity_page()
-
-        animation.finished.connect(finish)
-        self._sidebar_animation = animation
-        animation.start()
-        self._refresh_activity_page()
+            self.sidebar_button.set_direction("left" if expanding else "right")
+            self.sidebar_button.setToolTip(
+                "收起侧栏 (Ctrl+B)" if expanding else "展开侧栏 (Ctrl+B)"
+            )
+        finally:
+            self.splitter.setUpdatesEnabled(True)
 
     def toggle_topbar(self) -> None:
         if self.dataset is None:
             return
-        expanding = self._topbar_collapsed
-        self._topbar_collapsed = not expanding
         if self._topbar_animation is not None:
             self._topbar_animation.stop()
-        current_height = self.inspection_bar.height() if self.inspection_bar.isVisible() else 0
-        if expanding:
-            self.inspection_bar.show()
-            self.inspection_bar.setMinimumHeight(0)
-            self.inspection_bar.setMaximumHeight(max(0, current_height))
-            start = max(0, current_height)
-            end = max(self._topbar_expanded_height, self.inspection_bar.sizeHint().height())
-        else:
-            if current_height > 0:
-                self._topbar_expanded_height = current_height
-            self.inspection_bar.setMinimumHeight(0)
-            self.inspection_bar.setMaximumHeight(max(0, current_height))
-            start, end = max(0, current_height), 0
-
-        animation = QPropertyAnimation(self.inspection_bar, b"maximumHeight", self)
-        animation.setDuration(190)
-        animation.setStartValue(start)
-        animation.setEndValue(end)
-        animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
-
-        def finish() -> None:
-            if expanding:
-                self.inspection_bar.setMinimumHeight(0)
-                self.inspection_bar.setMaximumHeight(16_777_215)
-            else:
-                self.inspection_bar.hide()
-                self.inspection_bar.setMaximumHeight(16_777_215)
-
-        animation.finished.connect(finish)
-        self._topbar_animation = animation
-        animation.start()
-        self.topbar_button.set_direction("up" if expanding else "down")
+            self._topbar_animation.deleteLater()
+            self._topbar_animation = None
+        self._topbar_collapsed = not self._topbar_collapsed
+        self.inspection_bar.setFixedHeight(
+            INSPECTION_BAR_CURSOR_HEIGHT
+            if self.crosshair_button.isChecked()
+            else INSPECTION_BAR_HEIGHT
+        )
+        self.inspection_bar.setVisible(not self._topbar_collapsed)
+        self.topbar_button.set_direction("down" if self._topbar_collapsed else "up")
         self.topbar_button.setToolTip(
-            ("收起" if expanding else "展开") + "检查工具栏"
+            ("展开" if self._topbar_collapsed else "收起") + "检查工具栏"
         )
 
     def toggle_chrome(self) -> None:
         self._chrome_hidden = not self._chrome_hidden
         widgets = {
             "title": self.title_bar,
-            "workspace_header": self.workspace_header,
             "inspection": self.inspection_bar,
             "navigation": self.sidebar,
             "inspector": self.inspector,
-            "bottom": self.review_bar,
+            "bottom": self.player_bar,
         }
         if self._chrome_hidden:
             self._chrome_visibility = {
@@ -2328,14 +2167,19 @@ class MainWindow(QMainWindow):
             }
             for widget in widgets.values():
                 widget.hide()
-            self.media_grid.setContentsMargins(0, 0, 0, 0)
-            self.media_grid.setSpacing(1)
+            self.media_grid.setContentsMargins(
+                MEDIA_COMPACT_MARGIN,
+                MEDIA_COMPACT_MARGIN,
+                MEDIA_COMPACT_MARGIN,
+                MEDIA_COMPACT_MARGIN,
+            )
+            self.media_grid.setSpacing(MEDIA_COMPACT_SPACING)
             self.status_text.setText("")
         else:
             for name, widget in widgets.items():
                 widget.setVisible(self._chrome_visibility.get(name, False))
-            self.media_grid.setContentsMargins(8, 8, 8, 8)
-            self.media_grid.setSpacing(8)
+            self.media_grid.setContentsMargins(MEDIA_MARGIN, MEDIA_MARGIN, MEDIA_MARGIN, MEDIA_MARGIN)
+            self.media_grid.setSpacing(MEDIA_SPACING)
             self._refresh_activity_page()
 
     def toggle_fullscreen(self) -> None:
@@ -2348,22 +2192,18 @@ class MainWindow(QMainWindow):
     def open_command_palette(self) -> None:
         actions: list[tuple[str, str, object]] = [
             ("打开项目", "Ctrl+O", self.choose_project),
-            ("切换到查看模式", "Ctrl+1", lambda: self.set_product_mode("view")),
-            ("切换到筛选模式", "Ctrl+2", lambda: self.set_product_mode("review")),
-            ("播放 / 暂停", "Space", self.toggle_playback),
+            ("播放 / 暂停", self._shortcut_text("playback"), self.toggle_playback),
+            ("第一帧", self._shortcut_text("first"), self.first_sample),
+            ("最后一帧", self._shortcut_text("last"), self.last_sample),
             ("上一帧", self._shortcut_text("previous"), self.previous_sample),
             ("下一帧", self._shortcut_text("next"), self.next_sample),
-            ("接受当前样本", self._shortcut_text("accept"), self.accept_current),
-            ("拒绝当前样本", "X", lambda: self.set_review_status("rejected")),
-            ("下一个未检查样本", "N", self.next_unreviewed),
-            ("下一个拒绝样本", "Shift+N", lambda: self.next_with_review_status("rejected")),
-            ("下一个带缺陷样本", "Ctrl+Shift+N", self.next_with_defect),
             ("显示 / 隐藏界面", "Tab", self.toggle_chrome),
             ("全屏", "F11", self.toggle_fullscreen),
             ("重置视图", self._shortcut_text("reset"), self.reset_views),
             ("打开检查器", "", self.open_inspector),
             ("左右图透明叠加", "", lambda: self.open_stereo_overlay(mode="overlay")),
             ("左右图绝对差值", "", lambda: self.open_stereo_overlay(mode="difference")),
+            ("将点云投影到左图", "", self.open_cloud_projection),
             (
                 "切换校正前 / 校正后",
                 "",
@@ -2372,6 +2212,7 @@ class MainWindow(QMainWindow):
                 ),
             ),
             ("导出当前视图", "", self.export_current_view),
+            ("导出调整后的原始分辨率图像", "", self.export_adjusted_image),
             ("设置", "Ctrl+,", self.open_settings),
         ]
         CommandPalette(actions, self).exec()
@@ -2379,109 +2220,6 @@ class MainWindow(QMainWindow):
     def _shortcut_text(self, action: str) -> str:
         text = QKeySequence(self.preferences.shortcuts[action]).toString(QKeySequence.SequenceFormat.NativeText)
         return "Enter" if text in {"Return", "回车"} else text
-
-    def _apply_preferences(self) -> None:
-        QApplication.instance().setStyleSheet(style_for(self.preferences.theme))
-        for action, shortcut in self.action_shortcuts.items():
-            shortcut.setKey(QKeySequence(self.preferences.shortcuts[action]))
-        self.previous_button.setText(self.preferences.button_labels["previous"])
-        self.next_button.setText(self.preferences.button_labels["next"])
-        self.accept_button.setText(self.preferences.button_labels["accept"])
-        self.reset_button.setText("重置视图")
-        self.previous_button.setToolTip(f"上一组 ({self._shortcut_text('previous')})")
-        self.next_button.setToolTip(f"下一组 ({self._shortcut_text('next')})")
-        self.accept_button.setToolTip(f"接受当前组 ({self._shortcut_text('accept')})")
-        self.reset_button.setToolTip(f"重置视图 ({self._shortcut_text('reset')})")
-
-    def open_settings(self) -> None:
-        self._stop_playback()
-        if self._settings_page is not None:
-            return
-        dialog = SettingsDialog(
-            self.preferences,
-            self,
-            calibration_options=self.calibration_options,
-            current_calibration_id=self.current_calibration_id,
-            project_available=self.dataset is not None,
-        )
-        dialog.set_embedded()
-        self._settings_page = dialog
-        self._settings_previous_context = (
-            self.title_bar.context.text(),
-            self.title_bar.context.isVisible(),
-        )
-        dialog.accepted.connect(lambda current=dialog: self._finish_settings(current, True))
-        dialog.rejected.connect(lambda current=dialog: self._finish_settings(current, False))
-        self.page_stack.addWidget(dialog)
-        self.page_stack.setCurrentWidget(dialog)
-        self.title_bar.set_context("设置")
-        self.title_bar.actions.hide()
-        self.title_bar.settings_button.hide()
-        self.app_status_bar.hide()
-        for shortcut in self.shortcuts:
-            shortcut.setEnabled(False)
-        dialog.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
-
-    def _finish_settings(self, dialog: SettingsDialog, save: bool) -> None:
-        if dialog is not self._settings_page:
-            return
-        if save:
-            self._apply_settings(dialog)
-        self.page_stack.setCurrentWidget(self.main_page)
-        self.page_stack.removeWidget(dialog)
-        dialog.deleteLater()
-        self._settings_page = None
-        previous_context, was_visible = self._settings_previous_context
-        self.title_bar.set_context(previous_context if was_visible else "")
-        self.title_bar.actions.show()
-        self.title_bar.settings_button.hide()
-        self.app_status_bar.hide()
-        for shortcut in self.shortcuts:
-            shortcut.setEnabled(True)
-
-    def _apply_settings(self, dialog: SettingsDialog) -> None:
-        point_limit_changed = dialog.preferences.point_limit != self.preferences.point_limit
-        cloud_render_changed = (
-            dialog.preferences.cloud_cam_offset,
-            dialog.preferences.cloud_grid,
-            dialog.preferences.cloud_dot_radius,
-            dialog.preferences.cloud_z_max,
-            dialog.preferences.cloud_tau_rel,
-            dialog.preferences.cloud_occlusion,
-        ) != (
-            self.preferences.cloud_cam_offset,
-            self.preferences.cloud_grid,
-            self.preferences.cloud_dot_radius,
-            self.preferences.cloud_z_max,
-            self.preferences.cloud_tau_rel,
-            self.preferences.cloud_occlusion,
-        )
-        calibration_changed = (
-            self.dataset is not None
-            and dialog.selected_calibration_id != self.current_calibration_id
-        )
-        self.preferences = dialog.preferences
-        self.preferences.save(self.settings)
-        self.calibration_options = list(dialog.calibration_options)
-        self._save_calibration_options()
-        if calibration_changed:
-            self._apply_calibration_selection(
-                dialog.selected_calibration_id,
-                rebuild=False,
-            )
-        else:
-            self._refresh_calibration_picker(self.current_calibration_id)
-        self._apply_preferences()
-        if (
-            point_limit_changed
-            or cloud_render_changed
-            or calibration_changed
-        ) and self.dataset is not None:
-            self.focused_modality = None
-            self._build_tile_pool()
-            self._rebuild_tiles()
-            self._show_current()
-        self.status_text.setText("设置已保存")
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -2546,6 +2284,51 @@ class MainWindow(QMainWindow):
         else:
             self.showMaximized()
 
+    RESIZE_BORDER = 7
+
+    def _system_resize_edges(self, x: float, y: float):
+        """Return the Qt edge flags under (x, y) for platforms without a native frame."""
+        if sys.platform == "win32" or self.isMaximized() or self.isFullScreen():
+            return None
+        border = self.RESIZE_BORDER
+        edges = None
+        for hit, edge in (
+            (x < border, Qt.Edge.LeftEdge),
+            (x >= self.width() - border, Qt.Edge.RightEdge),
+            (y < border, Qt.Edge.TopEdge),
+            (y >= self.height() - border, Qt.Edge.BottomEdge),
+        ):
+            if hit:
+                edges = edge if edges is None else edges | edge
+        return edges
+
+    @staticmethod
+    def _cursor_for_edges(edges) -> Qt.CursorShape:
+        horizontal = bool(edges & Qt.Edge.LeftEdge) or bool(edges & Qt.Edge.RightEdge)
+        vertical = bool(edges & Qt.Edge.TopEdge) or bool(edges & Qt.Edge.BottomEdge)
+        if horizontal and vertical:
+            top_left = bool(edges & Qt.Edge.TopEdge) == bool(edges & Qt.Edge.LeftEdge)
+            return Qt.CursorShape.SizeFDiagCursor if top_left else Qt.CursorShape.SizeBDiagCursor
+        return Qt.CursorShape.SizeHorCursor if horizontal else Qt.CursorShape.SizeVerCursor
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            edges = self._system_resize_edges(event.position().x(), event.position().y())
+            handle = self.windowHandle()
+            if edges is not None and handle is not None and handle.startSystemResize(edges):
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if sys.platform != "win32":
+            edges = self._system_resize_edges(event.position().x(), event.position().y())
+            if edges is not None:
+                self.setCursor(self._cursor_for_edges(edges))
+            else:
+                self.unsetCursor()
+        super().mouseMoveEvent(event)
+
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange:
@@ -2569,98 +2352,15 @@ class MainWindow(QMainWindow):
                         return True, hit
         return super().nativeEvent(event_type, message)
 
-    def configure_output(self) -> None:
-        if self.product_mode != "review" or self.dataset is None:
-            return
-        dialog = OutputSettingsDialog(self.dataset.root, self.dataset.output_root, self)
-        if not dialog.exec():
-            return
-        selected = dialog.output_root
-        if selected == self.dataset.output_root.resolve():
-            return
-
-        previous_custom_root = self.dataset.custom_output_root
-        previous_store = self.review_store
-        previous_accepted = set(self.accepted)
-        self.dataset.custom_output_root = selected
-        try:
-            store = ReviewStore(self.dataset)
-            accepted = store.reconcile()
-        except Exception as exc:
-            self.dataset.custom_output_root = previous_custom_root
-            self.review_store = previous_store
-            self.accepted = previous_accepted
-            QMessageBox.critical(self, "无法使用输出文件夹", str(exc))
-            return
-
-        self.review_store = store
-        self.accepted = accepted
-        self._save_output_for(self.dataset.root, selected)
-        self.output_label.setText(str(selected))
-        self.output_label.setToolTip(str(selected))
-        self._update_review_stats()
-        self._show_current()
-        self.status_text.setText("输出位置已更新；原输出文件不会移动")
-
-    def open_annotation(self) -> None:
-        if (
-            self.product_mode != "review"
-            or self.dataset is None
-            or not self.dataset.samples
-        ):
-            return
-        sample = self.dataset.samples[self.current_index]
-        if self.review_store is None:
-            try:
-                self.review_store = ReviewStore(self.dataset)
-                self.accepted = self.review_store.reconcile()
-            except Exception as exc:
-                QMessageBox.critical(self, "无法保存审核记录", str(exc))
-                return
-
-        record = self.review_store.get(sample)
-        dialog = AnnotationDialog(
-            sample,
-            list(record["defect_tags"]),
-            str(record["note"]),
-            self,
-        )
-        if not dialog.exec():
-            return
-        try:
-            self.review_store.set_annotation(
-                sample,
-                dialog.selected_tags(),
-                dialog.note(),
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "无法保存审核记录", str(exc))
-            return
-        self._update_annotation_button(sample)
-        self.status_text.setText("缺陷与备注已保存")
-
-    def _update_annotation_button(self, sample) -> None:
-        record = self.review_store.get(sample) if self.review_store is not None else {}
-        tags = [str(tag) for tag in record.get("defect_tags", [])]
-        note = str(record.get("note", "")).strip()
-        detail_count = len(tags) + bool(note)
-        self.annotation_button.setText(
-            f"缺陷与备注 · {detail_count}" if detail_count else "缺陷与备注"
-        )
-        details = "、".join(tags)
-        if note:
-            details = f"{details}\n{note}" if details else note
-        self.annotation_button.setToolTip(details or "记录缺陷标签和文字备注")
-
-    def open_output_folder(self) -> None:
-        if self.dataset is None:
-            return
-        self.dataset.output_root.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(self.dataset.output_root.as_uri())
-
     def closeEvent(self, event) -> None:
+        self._playback_timer.stop()
+        self._cursor_update_timer.stop()
+        self._rectify_token = None
         for tile in self.tile_pool.values():
             tile.dispose()
+        application = QApplication.instance()
+        if application is not None and hasattr(self, "tooltip_manager"):
+            self.tooltip_manager.dispose()
         super().closeEvent(event)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
@@ -2678,8 +2378,9 @@ class MainWindow(QMainWindow):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="双目图像与点云人工筛选器")
+    parser = argparse.ArgumentParser(description="双目图像、深度与点云查看工作台")
     parser.add_argument("project", nargs="?", type=Path, help="启动时打开的项目文件夹")
+    parser.add_argument("--verbose", action="store_true", help="输出调试级别日志")
     parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
     return parser
 
@@ -2701,7 +2402,7 @@ def start_smoke_test(app: QApplication, window: MainWindow, timeout_seconds: flo
         if window.dataset is None or not window.dataset.samples:
             return
         if not configured:
-            for name, checkbox in window.checkboxes.items():
+            for checkbox in window.checkboxes.values():
                 checkbox.blockSignals(True)
                 checkbox.setChecked(checkbox.isEnabled())
                 checkbox.blockSignals(False)
@@ -2709,12 +2410,12 @@ def start_smoke_test(app: QApplication, window: MainWindow, timeout_seconds: flo
             window._show_current()
             configured = True
             return
-        if any(tile._workers or tile._loading_delay.isActive() for tile in window.tiles.values()):
+        if any(tile.has_pending_work() for tile in window.tiles.values()):
             return
         failed = []
         for modality, tile in window.tiles.items():
             expected = tile.cloud_canvas if modality == "ply" else tile.image_canvas
-            if expected is None or tile.stack.currentWidget() is not expected:
+            if expected is None or not tile.showing_canvas():
                 failed.append(modality)
         timer.stop()
         window.close()
@@ -2735,7 +2436,8 @@ def run_application(
     app.setStyle("Fusion")
     startup_preferences = AppPreferences.load(QSettings("ToolBox", "StereoSelector"))
     app.setStyleSheet(style_for(startup_preferences.theme))
-    QThreadPool.globalInstance().setMaxThreadCount(3)
+    app.setPalette(palette_for(startup_preferences.theme))
+    configure_pools()
     window = MainWindow(args.project)
     window.setWindowIcon(app.windowIcon())
     window.show()

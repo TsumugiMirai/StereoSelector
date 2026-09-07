@@ -1,10 +1,4 @@
-numpy>=1.26,<3
-opencv-python-headless>=4.10,<5
-Pillow>=10.3,<12
-plyfile>=1.0.3,<2
-PyOpenGL>=3.1.7,<4
-pyqtgraph>=0.13.7,<0.15
-PySide6>=6.7,<7
-PyYAML>=6.0.2,<7
-pyinstaller>=6.8,<7
-pytest>=8,<9
+# Dependencies are declared once in pyproject.toml. This file only exists for
+# tools that expect a requirements file; it installs the project in editable
+# mode together with the build and test extras.
+-e .[build,test]

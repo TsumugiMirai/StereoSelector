@@ -1,21 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import math
-
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QEasingCurve,
-    QPoint,
     Property,
+    QEasingCurve,
     QPropertyAnimation,
-    QSettings,
-    Signal,
-    Qt,
     QRectF,
+    QSettings,
+    Qt,
 )
-from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen
+from PySide6.QtGui import (
+    QColor,
+    QKeySequence,
+    QPainter,
+    QPen,
+)
 from PySide6.QtWidgets import (
     QAbstractButton,
     QButtonGroup,
@@ -23,15 +25,13 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
-    QGraphicsOpacityEffect,
     QHBoxLayout,
     QKeySequenceEdit,
     QLabel,
-    QLineEdit,
     QListWidget,
-    QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStackedWidget,
     QVBoxLayout,
@@ -39,23 +39,15 @@ from PySide6.QtWidgets import (
 )
 
 from .calibration import CalibrationOption, custom_calibration_option, load_calibration
-
-DEFAULT_LABELS = {
-    "previous": "上一组",
-    "next": "下一组",
-    "accept": "接受",
-}
-
-LEGACY_DEFAULT_LABELS = {
-    "previous": "←  上一组",
-    "next": "跳过 / 下一组  →",
-    "accept": "接受并继续",
-}
+from .ui_controls import ChoiceButton
+from .units import DEPTH_UNIT_CHOICES, normalize_depth_unit
 
 DEFAULT_SHORTCUTS = {
     "previous": "Left",
     "next": "Right",
-    "accept": "Return",
+    "first": "Home",
+    "last": "End",
+    "playback": "Space",
     "focus": "F",
     "reset": "R",
 }
@@ -63,12 +55,27 @@ DEFAULT_SHORTCUTS = {
 ACTION_NAMES = {
     "previous": "上一组",
     "next": "下一组",
-    "accept": "接受当前组",
+    "first": "第一组",
+    "last": "最后一组",
+    "playback": "播放 / 暂停",
     "focus": "聚焦视图",
     "reset": "重置视图",
 }
 
-RESERVED_SHORTCUTS = ("Home", "End", "Escape", "Ctrl+B", "Ctrl+O", "N", "Ctrl+,", "1", "2", "3", "4", "5")
+RESERVED_SHORTCUTS = (
+    "Escape",
+    "Ctrl+B",
+    "Ctrl+O",
+    "Ctrl+,",
+    "Tab",
+    "F11",
+    "Ctrl+Shift+P",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+)
 _DIALOG_SHADOW_MARGINS = (20, 15, 20, 24)
 
 
@@ -143,7 +150,6 @@ class ShadowDialog(QDialog):
 @dataclass
 class AppPreferences:
     theme: str = "dark"
-    auto_advance: bool = True
     point_limit: int = 300_000
     cloud_cam_offset: float = 0.05
     cloud_grid: int = 5
@@ -151,15 +157,19 @@ class AppPreferences:
     cloud_z_max: float = 10.0
     cloud_tau_rel: float = 0.15
     cloud_occlusion: bool = True
-    button_labels: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_LABELS))
+    depth_unit: str = "auto"
     shortcuts: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_SHORTCUTS))
 
+    def __post_init__(self) -> None:
+        # Ignore removed actions without deleting their persisted settings.
+        self.shortcuts = {
+            action: self.shortcuts.get(action, default)
+            for action, default in DEFAULT_SHORTCUTS.items()
+        }
+        self.depth_unit = normalize_depth_unit(self.depth_unit)
+
     @classmethod
-    def load(cls, settings: QSettings) -> "AppPreferences":
-        labels = {}
-        for key, default in DEFAULT_LABELS.items():
-            value = str(settings.value(f"preferences/buttons/{key}", default)).strip()
-            labels[key] = default if not value or value == LEGACY_DEFAULT_LABELS[key] else value
+    def load(cls, settings: QSettings) -> AppPreferences:
         shortcuts = {
             key: QKeySequence(str(settings.value(f"preferences/shortcuts/{key}", default))).toString(
                 QKeySequence.SequenceFormat.PortableText
@@ -223,7 +233,6 @@ class AppPreferences:
                 z_max = 10.0
         return cls(
             theme=theme,
-            auto_advance=settings.value("preferences/auto_advance", True, type=bool),
             point_limit=point_limit,
             cloud_cam_offset=max(0.0, min(1.0, cam_offset)),
             cloud_grid=max(1, min(32, grid)),
@@ -235,13 +244,13 @@ class AppPreferences:
                 True,
                 type=bool,
             ),
-            button_labels=labels,
+            depth_unit=normalize_depth_unit(settings.value("preferences/depth_unit", "auto")),
             shortcuts=shortcuts,
         )
 
     def save(self, settings: QSettings) -> None:
         settings.setValue("preferences/theme", self.theme)
-        settings.setValue("preferences/auto_advance", self.auto_advance)
+        settings.setValue("preferences/depth_unit", self.depth_unit)
         settings.setValue("preferences/point_limit", self.point_limit)
         settings.setValue("preferences/point_cloud/cam_offset", self.cloud_cam_offset)
         settings.setValue("preferences/point_cloud/grid", self.cloud_grid)
@@ -250,10 +259,8 @@ class AppPreferences:
         settings.setValue("preferences/point_cloud/tau_rel", self.cloud_tau_rel)
         settings.setValue("preferences/point_cloud/occlusion", self.cloud_occlusion)
         settings.setValue("preferences/point_cloud/defaults_version", 2)
-        for key, value in self.button_labels.items():
-            settings.setValue(f"preferences/buttons/{key}", value)
-        for key, value in self.shortcuts.items():
-            settings.setValue(f"preferences/shortcuts/{key}", value)
+        for key, default in DEFAULT_SHORTCUTS.items():
+            settings.setValue(f"preferences/shortcuts/{key}", self.shortcuts.get(key, default))
         settings.sync()
 
 
@@ -292,17 +299,23 @@ class ToggleSwitch(QAbstractButton):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if self.isChecked():
-            track = QColor("#4c9ffe")
-            knob = QColor("#ffffff")
+            track = self.palette().highlight().color()
+            knob = self.palette().highlightedText().color()
         else:
             track = self.palette().mid().color()
             knob = self.palette().buttonText().color()
+        if not self.isEnabled():
+            painter.setOpacity(0.5)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(track)
         painter.drawRoundedRect(QRectF(0, 0, 38, 22), 11, 11)
         painter.setBrush(knob)
         x = 3 + 16 * self._knob_progress
         painter.drawEllipse(QRectF(x, 3, 16, 16))
+        if self.hasFocus():
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(self.palette().highlight().color(), 1))
+            painter.drawRoundedRect(QRectF(0.5, 0.5, 37, 21), 10.5, 10.5)
 
 
 class SegmentedControl(QFrame):
@@ -340,90 +353,6 @@ class SegmentedControl(QFrame):
             self._buttons[index].setChecked(True)
 
 
-class ChoiceButton(QPushButton):
-    """A theme-owned select control that never opens a native Windows combo popup."""
-
-    currentIndexChanged = Signal(int)
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setObjectName("choiceButton")
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumWidth(120)
-        self._items: list[tuple[str, object, QAction]] = []
-        self._current_index = -1
-        self._menu = QMenu(self)
-        self._menu.setObjectName("choiceMenu")
-        self._menu.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
-        self.clicked.connect(self.showPopup)
-
-    def addItem(self, text: str, data: object = None) -> None:
-        index = len(self._items)
-        action = QAction(text, self._menu)
-        action.setCheckable(True)
-        action.triggered.connect(lambda _checked=False, item_index=index: self.setCurrentIndex(item_index))
-        self._menu.addAction(action)
-        self._items.append((text, data, action))
-        if self._current_index < 0:
-            self.setCurrentIndex(0)
-
-    def clear(self) -> None:
-        self._menu.clear()
-        self._items.clear()
-        self._current_index = -1
-        self.setText("")
-
-    def count(self) -> int:
-        return len(self._items)
-
-    def itemText(self, index: int) -> str:
-        return self._items[index][0] if 0 <= index < len(self._items) else ""
-
-    def itemData(self, index: int) -> object:
-        return self._items[index][1] if 0 <= index < len(self._items) else None
-
-    def currentData(self) -> object:
-        return self.itemData(self._current_index)
-
-    def currentText(self) -> str:
-        return self.itemText(self._current_index)
-
-    def currentIndex(self) -> int:
-        return self._current_index
-
-    def findData(self, data: object) -> int:
-        return next((index for index, (_, value, _) in enumerate(self._items) if value == data), -1)
-
-    def setCurrentIndex(self, index: int) -> None:
-        if not 0 <= index < len(self._items) or index == self._current_index:
-            return
-        self._current_index = index
-        text, _, _ = self._items[index]
-        self.setText(text)
-        for item_index, (_, _, action) in enumerate(self._items):
-            action.setChecked(item_index == index)
-        self.currentIndexChanged.emit(index)
-        self.update()
-
-    def showPopup(self) -> None:
-        if not self.isEnabled() or not self._items:
-            return
-        self._menu.setMinimumWidth(self.width())
-        self._menu.popup(self.mapToGlobal(QPoint(0, self.height() + 4)))
-
-    def paintEvent(self, event) -> None:
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(self.palette().buttonText().color(), 1.25)
-        pen.setCosmetic(True)
-        painter.setPen(pen)
-        x = self.width() - 15
-        y = self.height() // 2
-        painter.drawLine(x - 3, y - 2, x, y + 1)
-        painter.drawLine(x, y + 1, x + 3, y - 2)
-
-
 class SettingRow(QFrame):
     def __init__(self, title: str, description: str, control: QWidget, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -436,6 +365,8 @@ class SettingRow(QFrame):
         copy.setSpacing(2)
         heading = QLabel(title)
         heading.setObjectName("settingRowTitle")
+        heading.setBuddy(control)
+        control.setAccessibleName(title)
         copy.addWidget(heading)
         if description:
             detail = QLabel(description)
@@ -498,7 +429,6 @@ class SettingsDialog(ShadowDialog):
         self.setMinimumSize(720, 540)
         self.preferences = AppPreferences(
             theme=preferences.theme,
-            auto_advance=preferences.auto_advance,
             point_limit=preferences.point_limit,
             cloud_cam_offset=preferences.cloud_cam_offset,
             cloud_grid=preferences.cloud_grid,
@@ -506,14 +436,13 @@ class SettingsDialog(ShadowDialog):
             cloud_z_max=preferences.cloud_z_max,
             cloud_tau_rel=preferences.cloud_tau_rel,
             cloud_occlusion=preferences.cloud_occlusion,
-            button_labels=dict(preferences.button_labels),
+            depth_unit=preferences.depth_unit,
             shortcuts=dict(preferences.shortcuts),
         )
         self.calibration_options = list(calibration_options or [])
         self.current_calibration_id = current_calibration_id
         self.selected_calibration_id = current_calibration_id if project_available else ""
         self.project_available = project_available
-        self._page_animation: QPropertyAnimation | None = None
 
         outer = self.outer
         self.header = DialogHeader()
@@ -535,13 +464,11 @@ class SettingsDialog(ShadowDialog):
         self.navigation = QListWidget()
         self.navigation.setObjectName("settingsNav")
         self.navigation.setFixedWidth(176)
-        self.navigation.addItems(["外观", "交互", "标定", "按钮文字", "快捷键", "性能"])
+        self.navigation.addItems(["外观", "标定", "快捷键", "点云"])
         self.pages = QStackedWidget()
         self.pages.setObjectName("settingsPages")
         self.pages.addWidget(self._appearance_page())
-        self.pages.addWidget(self._interaction_page())
         self.pages.addWidget(self._calibration_page())
-        self.pages.addWidget(self._labels_page())
         self.pages.addWidget(self._shortcuts_page())
         self.pages.addWidget(self._performance_page())
         self.navigation.currentRowChanged.connect(self._switch_page)
@@ -591,13 +518,6 @@ class SettingsDialog(ShadowDialog):
         layout.addStretch(1)
         return page
 
-    def _interaction_page(self) -> QWidget:
-        page, layout = self._page("交互", "")
-        self.auto_advance_check = ToggleSwitch(self.preferences.auto_advance)
-        layout.addWidget(SettingRow("接受后自动前进", "复制完成后直接显示下一组样本。", self.auto_advance_check))
-        layout.addStretch(1)
-        return page
-
     def _calibration_page(self) -> QWidget:
         page, layout = self._page("相机标定", "管理内置标定或导入自定义 JSON / YAML 文件。")
         self.calibration_combo = ChoiceButton()
@@ -605,7 +525,7 @@ class SettingsDialog(ShadowDialog):
         self.calibration_combo.setMinimumWidth(230)
         self.calibration_combo.addItem("不使用标定", "")
         for option in self.calibration_options:
-            suffix = "内置" if option.builtin else "自定义"
+            suffix = "内置" if option.builtin else "项目内" if option.project_local else "自定义"
             self.calibration_combo.addItem(f"{option.label}  ·  {suffix}", option.id)
         selected_index = self.calibration_combo.findData(self.current_calibration_id)
         self.calibration_combo.setCurrentIndex(max(0, selected_index))
@@ -633,6 +553,22 @@ class SettingsDialog(ShadowDialog):
         self.calibration_detail.setWordWrap(True)
         self.calibration_detail.setMaximumWidth(960)
         layout.addWidget(self.calibration_detail)
+
+        self.depth_unit_combo = ChoiceButton()
+        self.depth_unit_combo.setObjectName("settingsCombo")
+        self.depth_unit_combo.setMinimumWidth(230)
+        for unit, label in DEPTH_UNIT_CHOICES:
+            self.depth_unit_combo.addItem(label, unit)
+        self.depth_unit_combo.setCurrentIndex(
+            max(0, self.depth_unit_combo.findData(self.preferences.depth_unit))
+        )
+        layout.addWidget(
+            SettingRow(
+                "深度单位",
+                "决定光标 XYZ、线段长度和点云外参如何换算为米。",
+                self.depth_unit_combo,
+            )
+        )
         if not self.project_available:
             no_project = QLabel("当前未打开项目；可以先导入文件，打开项目后再选择。")
             no_project.setObjectName("settingsDescription")
@@ -645,18 +581,9 @@ class SettingsDialog(ShadowDialog):
         return page
 
     def _switch_page(self, index: int) -> None:
+        # Pages contain live controls; opacity effects recreate their backing
+        # surfaces and race when a user changes pages quickly.
         self.pages.setCurrentIndex(index)
-        page = self.pages.currentWidget()
-        effect = QGraphicsOpacityEffect(page)
-        page.setGraphicsEffect(effect)
-        animation = QPropertyAnimation(effect, b"opacity", page)
-        animation.setDuration(150)
-        animation.setStartValue(0.35)
-        animation.setEndValue(1.0)
-        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        animation.finished.connect(lambda: page.setGraphicsEffect(None))
-        self._page_animation = animation
-        animation.start()
 
     def _calibration_changed(self) -> None:
         option_id = str(self.calibration_combo.currentData() or "")
@@ -667,7 +594,7 @@ class SettingsDialog(ShadowDialog):
         try:
             calibration = load_calibration(option.path)
             source = "内置预设" if option.builtin else str(option.path)
-            self.calibration_detail.setText(f"{calibration.summary}\n{source}")
+            self.calibration_detail.setText(f"{calibration.details}\n{source}")
         except ValueError as exc:
             self.calibration_detail.setText(str(exc))
 
@@ -692,21 +619,11 @@ class SettingsDialog(ShadowDialog):
             self.calibration_options.append(option)
             self.calibration_combo.addItem(f"{option.label}  ·  自定义", option.id)
         self.calibration_combo.setCurrentIndex(self.calibration_combo.findData(option.id))
-        self.calibration_detail.setText(f"{calibration.summary}\n{option.path}")
-
-    def _labels_page(self) -> QWidget:
-        page, layout = self._page("按钮文字", "显示在底部审阅栏中。")
-        self.label_edits: dict[str, QLineEdit] = {}
-        for action in ("previous", "next", "accept"):
-            edit = QLineEdit(self.preferences.button_labels[action])
-            edit.setMinimumWidth(230)
-            self.label_edits[action] = edit
-            layout.addWidget(SettingRow(ACTION_NAMES[action], "", edit))
-        layout.addStretch(1)
-        return page
+        self.calibration_detail.setText(f"{calibration.details}\n{option.path}")
 
     def _shortcuts_page(self) -> QWidget:
-        page, layout = self._page("快捷键", "点击输入框后按下新的按键组合。")
+        content, layout = self._page("快捷键", "点击输入框后按下新的按键组合。")
+        content.setObjectName("settingsScrollBody")
         self.shortcut_edits: dict[str, QKeySequenceEdit] = {}
         for action in DEFAULT_SHORTCUTS:
             edit = QKeySequenceEdit(QKeySequence(self.preferences.shortcuts[action]))
@@ -715,10 +632,21 @@ class SettingsDialog(ShadowDialog):
             self.shortcut_edits[action] = edit
             layout.addWidget(SettingRow(ACTION_NAMES[action], "", edit))
         layout.addStretch(1)
-        return page
+        return self._scroll_page(content)
+
+    @staticmethod
+    def _scroll_page(content: QWidget) -> QScrollArea:
+        content.setObjectName("settingsScrollBody")
+        scroll = QScrollArea()
+        scroll.setObjectName("settingsScroll")
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        return scroll
 
     def _performance_page(self) -> QWidget:
-        page, layout = self._page("性能", "")
+        page, layout = self._page("点云", "渲染参数与显示性能。")
         self.point_limit_spin = QSpinBox()
         self.point_limit_spin.setRange(50_000, 1_000_000)
         self.point_limit_spin.setSingleStep(50_000)
@@ -802,11 +730,10 @@ class SettingsDialog(ShadowDialog):
             )
         )
         layout.addStretch(1)
-        return page
+        return self._scroll_page(page)
 
     def _reset_defaults(self) -> None:
         self.theme_combo.setCurrentIndex(0)
-        self.auto_advance_check.setChecked(True)
         self.point_limit_spin.setValue(300_000)
         self.cloud_cam_offset_spin.setValue(0.05)
         self.cloud_grid_spin.setValue(5)
@@ -814,10 +741,9 @@ class SettingsDialog(ShadowDialog):
         self.cloud_z_max_spin.setValue(10.0)
         self.cloud_tau_rel_spin.setValue(0.15)
         self.cloud_occlusion_check.setChecked(True)
+        self.depth_unit_combo.setCurrentIndex(0)
         if self.project_available:
             self.calibration_combo.setCurrentIndex(0)
-        for key, edit in self.label_edits.items():
-            edit.setText(DEFAULT_LABELS[key])
         for key, edit in self.shortcut_edits.items():
             edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS[key]))
 
@@ -841,12 +767,7 @@ class SettingsDialog(ShadowDialog):
                 f"以下操作使用了保留快捷键：{names}\n\n请改用其他按键组合。",
             )
             return
-        labels = {key: edit.text().strip() for key, edit in self.label_edits.items()}
-        if any(not value for value in labels.values()):
-            QMessageBox.warning(self, "按钮文字不能为空", "请填写所有按钮文字。")
-            return
         self.preferences.theme = self.theme_combo.currentData()
-        self.preferences.auto_advance = self.auto_advance_check.isChecked()
         self.preferences.point_limit = self.point_limit_spin.value()
         self.preferences.cloud_cam_offset = self.cloud_cam_offset_spin.value()
         self.preferences.cloud_grid = self.cloud_grid_spin.value()
@@ -854,7 +775,7 @@ class SettingsDialog(ShadowDialog):
         self.preferences.cloud_z_max = self.cloud_z_max_spin.value()
         self.preferences.cloud_tau_rel = self.cloud_tau_rel_spin.value()
         self.preferences.cloud_occlusion = self.cloud_occlusion_check.isChecked()
-        self.preferences.button_labels = labels
+        self.preferences.depth_unit = normalize_depth_unit(self.depth_unit_combo.currentData())
         self.preferences.shortcuts = sequences
         self.selected_calibration_id = (
             str(self.calibration_combo.currentData() or "")
